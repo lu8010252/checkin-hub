@@ -1,0 +1,9 @@
+services:
+  checkin:
+    image: ghcr.io/lu8010252/checkin-hub:latest   # amd64 / arm64 / armv7 通用
+    # build: .                                    # 想本地构建就取消注释，再 docker compose up -d --build
+    container_name: checkin-hub
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/data   # 保存轮换后的令牌和当日状态，别删
