@@ -10,8 +10,35 @@ import urllib.request
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 
 
+CONFIG_FILE = "config.json"
+_cfg_cache = {"sig": None, "data": {}}
+
+
+def _overrides():
+    """网页后台保存的配置（data/config.json），按文件变化自动重读，改完立即生效。"""
+    try:
+        s = os.stat(os.path.join(DATA_DIR, CONFIG_FILE))
+        sig = (s.st_mtime_ns, s.st_size)
+    except OSError:
+        return {}
+    if sig != _cfg_cache["sig"]:
+        _cfg_cache["data"] = load_json(CONFIG_FILE, {})
+        _cfg_cache["sig"] = sig
+    return _cfg_cache["data"]
+
+
 def env(name, default=""):
+    """优先读网页里保存的配置，其次读环境变量。"""
+    ov = _overrides()
+    if name in ov:
+        return str(ov[name] or default).strip()
     return (os.getenv(name) or default).strip()
+
+
+def save_config(updates):
+    cur = dict(load_json(CONFIG_FILE, {}))
+    cur.update(updates)
+    save_json(CONFIG_FILE, cur)
 
 
 # ---------- 时间（固定北京时间，不依赖容器时区） ----------
@@ -37,7 +64,7 @@ def log(msg):
 
 
 # ---------- HTTP ----------
-_proxy = env("CHECKIN_PROXY")
+_proxy = (os.getenv("CHECKIN_PROXY") or "").strip()  # 只读环境变量（模块加载时 load_json 还没定义）
 _opener = urllib.request.build_opener(
     urllib.request.ProxyHandler({"http": _proxy, "https": _proxy} if _proxy else {})
 )
@@ -73,6 +100,10 @@ def save_json(name, obj):
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(obj, fh, ensure_ascii=False, indent=2)
+        try:
+            os.chmod(tmp, 0o600)  # 里面有账号凭证
+        except OSError:
+            pass
         os.replace(tmp, path)
     except Exception as e:  # noqa: BLE001
         log("⚠️ 写入 %s 失败: %s" % (name, e))
@@ -132,9 +163,10 @@ def fmt_num(v):
         return str(v)
 
 
-def result(kind, msg):
-    """kind: ok 签到成功 / already 今天已签 / soft 稍后重试 / auth 令牌失效 / fail 其它失败"""
-    return {"kind": kind, "msg": msg}
+def result(kind, msg, **extra):
+    """kind: ok 签到成功 / already 今天已签 / soft 稍后重试 / auth 令牌失效 / fail 其它失败
+    extra: 可选的附加信息（积分余额 balance、连签 streak 等），网页上展示。"""
+    return {"kind": kind, "msg": msg, "extra": extra}
 
 
 def notify(title, text):

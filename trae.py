@@ -54,16 +54,21 @@ def explain_err(text):
 
 class Trae:
     name = "Trae"
+    TIME_ENV = "TRAE_TIME"
 
     @staticmethod
-    def enabled():
+    def configured():
         return bool(env("TRAE_REFRESH_TOKEN"))
+
+    @classmethod
+    def enabled(cls):
+        return cls.configured() and env("TRAE_ENABLED", "1") != "0"
 
     def __init__(self):
         self.did = env("TRAE_DEVICE_ID")
         self.machine = env("TRAE_MACHINE_ID")
-        self.priv = norm_pem(os.getenv("TRAE_DEVICE_KEY_PEM", ""))
-        self.pub = norm_pem(os.getenv("TRAE_DEVICE_PUB_PEM", ""))
+        self.priv = norm_pem(env("TRAE_DEVICE_KEY_PEM"))
+        self.pub = norm_pem(env("TRAE_DEVICE_PUB_PEM"))
         self.client_id = env("TRAE_CLIENT_ID", "ono9krqynydwx5")
         self.version = env("TRAE_IDE_VERSION", "1.107.1")
         self.store = TokenStore("trae", env("TRAE_REFRESH_TOKEN"))
@@ -176,9 +181,11 @@ class Trae:
             pass
         return None
 
-    def _done_msg(self, tk, head):
+    def _done(self, tk, kind, head):
         bal = self._balance(tk)
-        return head + ("，积分余额 %s" % fmt_num(bal) if bal is not None else "")
+        if bal is None:
+            return result(kind, head)
+        return result(kind, "%s，积分余额 %s" % (head, fmt_num(bal)), balance=bal)
 
     # ---- 主流程 ----
     def run(self):
@@ -196,7 +203,7 @@ class Trae:
             if not isinstance(d, dict):
                 return result("soft", "状态查询无有效响应 http=%s %s" % (st, text[:80]))
             if d.get("checked_in"):
-                return result("already", self._done_msg(tk, "今日已签到"))
+                return self._done(tk, "already", "今日已签到")
             if d.get("enable") is False:
                 return result("fail", "该账号未开放签到（enable=false）")
 
@@ -206,7 +213,7 @@ class Trae:
                 _, _, d2, _ = self._ug(tk, EP_STATUS)
                 if isinstance(d2, dict) and d2.get("checked_in"):
                     head = "签到成功" + (" +%s 积分" % fmt_num(gained) if gained else "")
-                    return result("ok", self._done_msg(tk, head))
+                    return self._done(tk, "ok", head)
                 return result("soft", "领取接口返回成功，但回查未确认，稍后重试")
             if code in ALREADY:
                 return result("already", "今日已签到(%s)" % code)

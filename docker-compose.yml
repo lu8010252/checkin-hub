@@ -4,6 +4,10 @@ services:
     # build: .                                    # 想本地构建就取消注释，再 docker compose up -d --build
     container_name: checkin-hub
     restart: unless-stopped
-    env_file: .env
+    environment:
+      - WEB_PASSWORD=改成你自己的登录密码
+      # - TRUST_PROXY=1        # 前面有反向代理(HTTPS)时打开
+    ports:
+      - "8090:8080"            # 网页后台：http://服务器IP:8090
     volumes:
-      - ./data:/data   # 保存轮换后的令牌和当日状态，别删
+      - ./data:/data           # 令牌、设置、记录都在这里，别删

@@ -14,10 +14,15 @@ EP_STATUS = API + "/v2/billing/meter/checkin-activity-status"
 
 class WorkBuddy:
     name = "WorkBuddy"
+    TIME_ENV = "WORKBUDDY_TIME"
 
     @staticmethod
-    def enabled():
+    def configured():
         return bool(env("WORKBUDDY_REFRESH_TOKEN"))
+
+    @classmethod
+    def enabled(cls):
+        return cls.configured() and env("WORKBUDDY_ENABLED", "1") != "0"
 
     def __init__(self):
         self.store = TokenStore("workbuddy", env("WORKBUDDY_REFRESH_TOKEN"))
@@ -68,18 +73,18 @@ class WorkBuddy:
         code = c.get("code")
 
         # 3) 连签状态（失败不影响结果）
-        extra = ""
+        extra, info = "", {}
         try:
             _, s, _ = self._post(EP_STATUS, auth)
             if isinstance(s, dict) and s.get("code") == 0 and s.get("data"):
-                extra = "｜连签 %s 天，本期累计 %s 分" % (
-                    s["data"].get("streak_days"), fmt_num(s["data"].get("total_credits")))
+                info = {"streak": s["data"].get("streak_days"), "total": s["data"].get("total_credits")}
+                extra = "｜连签 %s 天，本期累计 %s 分" % (info["streak"], fmt_num(info["total"]))
         except Exception:  # noqa: BLE001
             pass
 
         if code == 0:
             got = (c.get("data") or {}).get("credit") if isinstance(c.get("data"), dict) else None
-            return result("ok", "签到成功 +%s 积分%s" % (fmt_num(got or 100), extra))
+            return result("ok", "签到成功 +%s 积分%s" % (fmt_num(got or 100), extra), **info)
         if code == 10001:
-            return result("already", "今日已签到%s" % extra)
+            return result("already", "今日已签到%s" % extra, **info)
         return result("fail", "签到异常 code=%s %s" % (code, c.get("msg")))
