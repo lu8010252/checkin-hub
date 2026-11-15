@@ -161,7 +161,21 @@ export async function qrQuickLogin(pp) {
     if (!loc) {
       const onConsole = /^https:\/\/console\.bce\.baidu\.com\//.test(url);
       const hasSess = jar.has('bce-sessionid');
-      if (onConsole && r.status === 200 && hasSess) return { cookies: jar.all(), account: pf.username };
+      if (onConsole && r.status === 200 && hasSess) {
+        // 控制台首页才下发 bce-user-info（领取接口要靠它解 csrftoken），
+        // /dumate/channel 这一步不一定带，缺了补几次首页请求
+        if (!jar.has('bce-user-info')) {
+          for (const u of [
+            'https://console.bce.baidu.com/',
+            'https://console.bce.baidu.com/?from=oa_dumate',
+            'https://console.bce.baidu.com/dumate/channel',
+          ]) {
+            try { await fetchGet(u, jar, 20_000); } catch { /* 单个失败不影响后续 */ }
+            if (jar.has('bce-user-info')) break;
+          }
+        }
+        return { cookies: jar.all(), account: pf.username };
+      }
       break;
     }
     url = new URL(loc, url).href;
