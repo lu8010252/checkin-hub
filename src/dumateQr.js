@@ -31,6 +31,7 @@
 
 import { randomBytes } from 'node:crypto';
 import { FETCH_TIMEOUT_MS } from './constants.js';
+import { healDumateCookies } from './dumateClient.js';
 
 export const DUMATE_QR_CONSOLE_URL = 'https://console.bce.baidu.com/dumate/channel';
 export const DUMATE_QR_UA =
@@ -174,7 +175,13 @@ export async function qrQuickLogin(pp) {
             if (jar.has('bce-user-info')) break;
           }
         }
-        return { cookies: jar.all(), account: pf.username };
+        let cookies = jar.all();
+        if (!jar.has('bce-user-info')) {
+          // 控制台首页没下发时，用 dumate 应用 token 接口取账户 ID 补 bce-user-info
+          const healed = await healDumateCookies(cookies).catch(() => null);
+          if (healed) cookies = healed;
+        }
+        return { cookies, account: pf.username };
       }
       break;
     }
