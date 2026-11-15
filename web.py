@@ -7,6 +7,7 @@
 import hashlib
 import hmac
 import html
+import json
 import os
 import re
 import secrets
@@ -17,6 +18,8 @@ from urllib.parse import parse_qs, urlparse
 
 import core
 import p256
+import trae_login
+import wbqr
 from common import (DATA_DIR, bj_date, bj_now, env, load_json, log, save_config,
                     save_json)
 
@@ -107,8 +110,8 @@ CSS = """
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 -apple-system,"PingFang SC","Microsoft YaHei",system-ui,sans-serif}
 .wrap{max-width:860px;margin:0 auto;padding:16px}
-header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:4px 0 16px}
-h1{font-size:20px;margin:0}h2{font-size:16px;margin:0 0 10px}
+header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:4px 0 16px;flex-wrap:wrap}
+h1{font-size:20px;margin:0;white-space:nowrap}h2{font-size:16px;margin:0 0 10px}
 nav{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
 nav a,nav button{color:var(--fg);text-decoration:none;padding:6px 12px;border:1px solid var(--line);border-radius:8px;background:var(--card);font:inherit;cursor:pointer}
 nav a.on{border-color:var(--ac);color:var(--ac)}
@@ -150,6 +153,7 @@ def page(title, body, active="", csrf=None):
     nav = ""
     if csrf is not None:
         nav = ('<nav><a class="%s" href="/">总览</a><a class="%s" href="/settings">设置</a>'
+               '<a href="/login/trae">Trae 登录</a><a href="/login/workbuddy">扫码登录</a>'
                '<form method="post" action="/logout" style="margin:0"><input type="hidden" name="csrf" value="%s">'
                '<button type="submit">退出</button></form></nav>') % (
             "on" if active == "home" else "", "on" if active == "settings" else "", E(csrf))
@@ -273,7 +277,7 @@ def render_settings(csrf, errors=None, saved=False, form=None):
                  '<label>每天开始签到的时间（北京时间）</label><input type="text" name="WORKBUDDY_TIME" value="%s" placeholder="00:30">'
                  '<label>refreshToken</label><textarea name="WORKBUDDY_REFRESH_TOKEN" placeholder="留空 = 不修改" '
                  'autocomplete="off" spellcheck="false"></textarea>'
-                 '<div class="hint">当前：%s。令牌每次续期会自动更新，一般不用再动；失效了才需要重新填。</div></div>'
+                 '<div class="hint">当前：%s。令牌每次续期会自动更新，一般不用再动；失效了直接点上方导航的「扫码登录」扫一下即可。</div></div>'
                  '<div class="card"><h2>Trae（国内版）</h2>'
                  '<label class="chk"><input type="checkbox" name="TRAE_ENABLED" value="1"%s>启用自动签到</label>'
                  '<label>每天开始签到的时间（北京时间）</label><input type="text" name="TRAE_TIME" value="%s" placeholder="00:23">'
@@ -461,11 +465,27 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         u = urlparse(self.path)
         sess = self.session()
+        q = parse_qs(u.query)
         if u.path == "/healthz":
             return self.send(200, "ok", "text/plain; charset=utf-8")
+        if u.path == "/trae/url":  # 登录脚本取登录地址：靠一次性 sid 鉴权，不用 cookie
+            url, err = trae_login.login_url((q.get("s") or [""])[0])
+            return self.send(200, json.dumps({"url": url} if url else {"error": err}, ensure_ascii=False),
+                             "application/json; charset=utf-8")
         if not sess:
             return self.send(200, self.login_page())
         csrf = csrf_token(sess)
+        if u.path == "/login/trae/helper.py":  # 下载一键登录脚本（必须已登录后台）
+            box = "http://" + (self.headers.get("Host") or "127.0.0.1:8090")
+            text = trae_login.script_text(box, (q.get("s") or [""])[0])
+            if text is None:
+                return self.send(404, "会话不存在、已过期或地址无效，请回网页重新生成", "text/plain; charset=utf-8")
+            return self.send(200, text, "application/octet-stream",
+                             [("Content-Disposition", 'attachment; filename="trae_login.py"')])
+        if u.path == "/login/trae":
+            return self.send(200, trae_login.render(csrf, (q.get("s") or [""])[0]))
+        if u.path == "/login/workbuddy":
+            return self.send(200, wbqr.render(csrf, (q.get("state") or [""])[0]))
         if u.path == "/":
             return self.send(200, render_home(csrf, (parse_qs(u.query).get("m") or [""])[0]))
         if u.path == "/settings":
@@ -474,6 +494,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urlparse(self.path)
+        if u.path == "/trae/code":  # 登录脚本转来授权码：靠一次性 sid 鉴权，请求体上限同其它接口
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                n = 0
+            if n > MAX_BODY:
+                return self.send(413, "too large", "text/plain; charset=utf-8")
+            raw = self.rfile.read(n).decode("utf-8", "replace") if n > 0 else ""
+            ok, msg = trae_login.complete((parse_qs(u.query).get("s") or [""])[0], raw)
+            return self.send(200, json.dumps({"ok": ok, "msg": msg}, ensure_ascii=False),
+                             "application/json; charset=utf-8")
         form = self.read_form()
         if form is None:
             return self.send(413, "too large", "text/plain; charset=utf-8")
@@ -501,6 +532,13 @@ class Handler(BaseHTTPRequestHandler):
 
         if u.path == "/logout":
             return self.redirect("/", [self.cookie_hdr("", 0)])
+        if u.path == "/login/trae":
+            return self.redirect("/login/trae?s=" + trae_login.new_session())
+        if u.path == "/login/workbuddy":
+            state, err = wbqr.new_state()
+            if err:
+                return self.send(200, wbqr.render_error(csrf_token(sess), err))
+            return self.redirect("/login/workbuddy?state=" + state)
         if u.path == "/settings":
             errors, _ = apply_settings(form)
             if errors:

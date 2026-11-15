@@ -94,20 +94,18 @@ def poll(state):
     return "ok", msg
 
 
-def qr_svg(text, box=6):
+def qr_svg(text, box=6, border=2):
     """把文本画成内联 SVG 二维码（页面 CSP 只允许内联样式，所以不用 <img>）。"""
     try:
-        import qrcode
+        import qr
 
-        q = qrcode.QRCode(border=2, box_size=1, error_correction=qrcode.constants.ERROR_CORRECT_M)
-        q.add_data(text)
-        q.make(fit=True)
-        m = q.get_matrix()
+        m = qr.encode(text)
     except Exception as e:  # noqa: BLE001
         log("⚠️ 二维码生成失败: %s" % e)
         return ""
-    n = len(m)
-    path = "".join("M%d %dh1v1h-1z" % (x, y) for y, row in enumerate(m) for x, v in enumerate(row) if v)
+    n = len(m) + border * 2
+    path = "".join("M%d %dh1v1h-1z" % (x + border, y + border)
+                   for y, row in enumerate(m) for x, v in enumerate(row) if v)
     return ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %d %d" width="%d" height="%d" '
             'shape-rendering="crispEdges" role="img" aria-label="登录二维码">'
             '<rect width="%d" height="%d" fill="#fff"/><path d="%s" fill="#000"/></svg>') % (

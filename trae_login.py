@@ -13,6 +13,7 @@ import time
 import urllib.parse
 import uuid
 
+import p256
 from common import env, log, post_json, save_config
 
 AUTH_URL = "https://www.trae.cn/authorization"
@@ -75,13 +76,33 @@ def _device_info():
     }
 
 
+def ensure_device():
+    """设置里没有设备号时，给盒子生成一个自己的设备身份（设备号、machineId、一对 P-256 密钥）。
+
+    已经填过设备号的（比如从电脑导出的）完全不动。想重置身份：把设置里的设备号清空再登录一次。
+    返回 True 表示这次新生成了。"""
+    if env("TRAE_DEVICE_ID"):
+        return False
+    priv, pub = p256.generate_keypair()
+    save_config({
+        "TRAE_DEVICE_ID": "7" + str(secrets.randbelow(10 ** 18)).zfill(18),
+        "TRAE_MACHINE_ID": secrets.token_hex(32),
+        "TRAE_DEVICE_KEY_PEM": priv,
+        "TRAE_DEVICE_PUB_PEM": pub,
+    })
+    log("Trae: 设置里没有设备身份，已为盒子生成一个新的")
+    return True
+
+
 def login_url(sid):
     """给脚本用的登录地址（PKCE + 本机回调）。"""
     s = _sessions.get(sid)
     if not s:
         return None, "登录会话不存在或已过期"
-    if not (env("TRAE_DEVICE_ID") and env("TRAE_DEVICE_PUB_PEM")):
-        return None, "缺少 TRAE_DEVICE_ID / TRAE_DEVICE_PUB_PEM，先到「设置」里补齐"
+    ensure_device()
+    missing = [k for k in ("TRAE_DEVICE_ID", "TRAE_DEVICE_PUB_PEM") if not env(k)]
+    if missing:
+        return None, "缺少 %s，先到「设置」里补齐（或清空设备号让盒子自动生成）" % " / ".join(missing)
     version = env("TRAE_IDE_VERSION", "1.107.1")
     q = {
         "login_version": "1",
@@ -271,7 +292,9 @@ def render(csrf, sid=""):
              '<button class="btn" type="submit">重新生成脚本</button></form>') % E(csrf)
     if not sid:
         body = (head + '<div class="msg mut">Trae 的登录回调只能落在打开登录页的那台电脑上（127.0.0.1），'
-                       '所以没法用手机扫码；这个脚本把最后一步自动化了，你只需要双击一次。</div>%s'
+                       '所以没法用手机扫码；这个脚本把最后一步自动化了，你只需要双击一次。'
+                       '<br>设置里没填设备号的话，会自动给盒子生成一个自己的设备身份，不用再从电脑导出，'
+                       '也不会影响电脑上的 Trae。</div>%s'
                        '<form method="post" action="/login/trae"><input type="hidden" name="csrf" value="%s">'
                        '<button class="btn" type="submit">生成登录脚本</button></form></div>') % (steps, E(csrf))
         return web.page("Trae 一键登录 - 签到中心", body, "settings", csrf)

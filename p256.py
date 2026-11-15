@@ -101,3 +101,20 @@ def sign_b64(pem, data):
             s = N - s
         body = _der_int(r) + _der_int(s)
         return base64.b64encode(b"\x30" + bytes([len(body)]) + body).decode("ascii")
+
+
+def _pem(label, der):
+    b64 = base64.b64encode(der).decode("ascii")
+    body = "\n".join(b64[i:i + 64] for i in range(0, len(b64), 64))
+    return "-----BEGIN %s-----\n%s\n-----END %s-----" % (label, body, label)
+
+
+def generate_keypair():
+    """生成一对 P-256 密钥，返回 (私钥 PKCS#8 PEM, 公钥 SPKI PEM)，格式与 OpenSSL/Node 导出的一致。"""
+    d = int.from_bytes(os.urandom(32), "big") % (N - 1) + 1
+    x, y = _mul(d, G)
+    point = b"\x04" + x.to_bytes(32, "big") + y.to_bytes(32, "big")
+    priv = (bytes.fromhex("308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b0201010420")
+            + d.to_bytes(32, "big") + bytes.fromhex("a144034200") + point)
+    pub = bytes.fromhex("3059301306072a8648ce3d020106082a8648ce3d030107034200") + point
+    return _pem("PRIVATE KEY", priv), _pem("PUBLIC KEY", pub)
