@@ -3,6 +3,9 @@ services:
     image: ghcr.io/lu8010252/checkin-hub:latest   # amd64 / arm64 / armv7 通用
     # build: .                                    # 想本地构建就取消注释，再 docker compose up -d --build
     container_name: checkin-hub
+    dns:                                          # 某些自定义网络里容器没有 DNS，加上更稳
+      - 223.5.5.5
+      - 119.29.29.29
     restart: unless-stopped
     environment:
       - WEB_PASSWORD=改成你自己的登录密码

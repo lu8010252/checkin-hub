@@ -1,10 +1,12 @@
 # checkin-hub 签到中心
 
-Trae（国内版）和 WorkBuddy 每日自动签到，带网页后台，docker 常驻，不用开电脑。纯 Python 标准库，无第三方依赖。
+Trae（国内版）和 WorkBuddy 每日自动签到，带网页后台，docker 常驻，不用开电脑。除二维码用的 `qrcode` 外全是 Python 标准库。
 
 - WorkBuddy：每天 100 积分（连签有额外奖励）
 - Trae：每天约 150 积分
 - **网页后台**：总览（今日是否签到、积分/连签、近 14 天、最近记录）、立即签到、在网页里改令牌/时间/通知，不用再改文件重启
+- **网页扫码登录**：令牌失效时在网页点一下生成二维码，手机扫码即可，令牌自动写入（WorkBuddy）
+- **网页一键登录**：Trae 生成一个脚本，在电脑上双击就跑完登录并回传令牌（Trae 的回调只能落在本机 127.0.0.1，没法手机扫码）
 - 每天北京时间 00:23（Trae）/ 00:30（WorkBuddy）起签，失败自动重试，成功/失败/放弃时推送 ntfy（可选）
 - 轮换后的令牌自动保存在 `./data`，容器重启不丢
 - 镜像由 GitHub Actions 构建：`linux/amd64`、`linux/arm64`、`linux/arm/v7`
@@ -30,33 +32,41 @@ docker compose up -d
 docker compose exec checkin python app.py once
 ```
 
-## 获取令牌
+## 登录 / 获取令牌
 
-### WorkBuddy（1 项）
+令牌在网页「设置」里改，改完今天还没签成的会立即重试。下面两种是推荐做法，末尾保留手动导出的备用方案。
 
-电脑上登录着 WorkBuddy 客户端，打开登录态文件，找到 `auth.refreshToken`（约 700 字符，整串复制，别漏）：
+### WorkBuddy：网页扫码
+
+后台导航「扫码登录」→ 点「生成二维码」→ 手机扫码登录。二维码里的 `state` 是一次性的（30 分钟有效），后台会轮询到令牌自动写入，并立刻重签一次。
+
+手动填的话：电脑上登录着 WorkBuddy 客户端，打开登录态文件，找到 `auth.refreshToken`（约 700 字符，整串复制，别漏）：
 
 - Windows：`%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info`（找不到再看 `%APPDATA%` 同路径）
 - macOS：`~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info`
 
-粘贴到网页「设置」的 WorkBuddy refreshToken。
+### Trae：网页一键登录
 
-### Trae（5 项）
+后台导航「Trae 登录」→ 生成登录脚本 → 下载后在自己电脑上双击（需要 Python 3）：
 
-Trae 续期需要「设备证明」，所以要从登录着 Trae 的那台电脑导出令牌和设备密钥。用 [L0NE-6/Trae-AutoCheckin](https://github.com/L0NE-6/Trae-AutoCheckin) 仓库里的 `trae_get_token.py`：
+1. 脚本在本机 `127.0.0.1:8931` 起回调服务（Trae 授权页只认这个地址，改成局域网地址会直接报「网络错误」）
+2. 自动打开 Trae 登录页，完成登录
+3. 脚本把授权码转给后台，后台用自己的设备身份换令牌、写进配置，然后立即重签
+
+脚本 30 分钟内有效，过期回网页重新生成即可。
+
+手动导出 5 项（`TRAE_REFRESH_TOKEN` / `TRAE_DEVICE_ID` / `TRAE_MACHINE_ID` / `TRAE_DEVICE_KEY_PEM` / `TRAE_DEVICE_PUB_PEM`）：Trae 续期需要「设备证明」，所以要从登录着 Trae 的那台电脑导出，用 [L0NE-6/Trae-AutoCheckin](https://github.com/L0NE-6/Trae-AutoCheckin) 里的 `trae_get_token.py`：
 
 ```bash
 python trae_get_token.py                 # 打印 TRAE_REFRESH_TOKEN
 python trae_get_token.py --export-keys   # 打印 TRAE_DEVICE_KEY_PEM / TRAE_DEVICE_PUB_PEM / TRAE_DEVICE_ID / TRAE_MACHINE_ID
 ```
 
-脚本只用 Python 标准库，不用装任何包；它读取 Trae 客户端本地的 `storage.json`（Windows 在 `%APPDATA%\Trae CN\User\globalStorage\`，macOS 在 `~/Library/Application Support/Trae CN/User/globalStorage/`），所以要先在这台电脑上登录过 Trae。
-
-把 5 项填进网页「设置」的 Trae 部分。PEM 可以直接粘贴多行，也可以是一行里用 `\n` 代替换行。输出里有令牌和设备私钥，别发给别人、别贴到公开的地方。
+PEM 可以直接粘贴多行，也可以是一行里用 `\n` 代替换行。输出里有令牌和设备私钥，别发给别人、别贴到公开的地方。
 
 ## 注意
 
-1. **Trae 的令牌只能在一处续期。** 服务器续期后，电脑上的 Trae 客户端登录态可能失效，需要重新登录；重新登录后，要重新导出一次填进网页。改了令牌后，今天没签成的会立即重试。
+1. **Trae 的令牌只能在一处续期。** 服务器续期后，电脑上的 Trae 客户端登录态可能失效，需要重新登录；重新登录后回网页点一次「Trae 登录」跑脚本即可。改了令牌后，今天没签成的会立即重试。
 2. 一个设备号一天只能签一个 Trae 账号，所以这里只支持单账号。
 3. 一直提示 9074：多半是设备号不对（必须是客户端真实注册的那串数字），重新导出。
 4. 这些是非官方接口，官方改接口或风控后可能失效；失效时会推送通知，网页和日志里有原因。账号风险自负，建议别用主力号。
