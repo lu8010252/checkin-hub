@@ -1,7 +1,4 @@
-"""容器入口：在原版网页后台的基础上加「扫码登录 / 一键登录」路由。
-
-放在 /data 里，容器重建也不会丢；docker-compose 里用 command 指到这里。
-"""
+"""容器入口：在原版网页后台的基础上加「扫码登录 / 一键登录」路由。"""
 import hmac
 import json
 import sys
@@ -9,9 +6,7 @@ import threading
 from http.server import ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-sys.path.insert(0, "/data")
 sys.path.insert(0, "/app")
-sys.path.insert(0, "/data/pylib")
 
 import core  # noqa: E402
 import trae_login  # noqa: E402
@@ -51,8 +46,13 @@ class Handler(web.Handler):
 
         if u.path == "/login/trae/helper.py":  # 下载一键登录脚本
             sid = (q.get("s") or [""])[0]
+            if not self.session():  # 和其它页面一样，下载脚本也要先登录后台
+                return self.send(200, self.login_page())
             box = "http://" + (self.headers.get("Host") or "127.0.0.1:8090")
-            return self.send(200, trae_login.script_text(box, sid), "application/octet-stream",
+            text = trae_login.script_text(box, sid)
+            if text is None:
+                return self.send(404, "会话不存在、已过期或地址无效，请回网页重新生成", "text/plain; charset=utf-8")
+            return self.send(200, text, "application/octet-stream",
                              [("Content-Disposition", 'attachment; filename="trae_login.py"')])
 
         if u.path == "/login/trae":
@@ -80,6 +80,8 @@ class Handler(web.Handler):
                 n = int(self.headers.get("Content-Length") or 0)
             except ValueError:
                 n = 0
+            if n > web.MAX_BODY:
+                return self.send(413, "too large", "text/plain; charset=utf-8")
             raw = self.rfile.read(n).decode("utf-8", "replace") if n > 0 else ""
             ok, msg = trae_login.complete(sid, raw)
             return self.send(200, json.dumps({"ok": ok, "msg": msg}, ensure_ascii=False),
@@ -121,4 +123,5 @@ def main():
     core.daemon_loop()
 
 
-main()
+if __name__ == "__main__":
+    main()

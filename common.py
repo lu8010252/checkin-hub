@@ -83,6 +83,18 @@ def post_json(url, headers, body="{}", timeout=30):
         return -1, str(e)
 
 
+def get_json_text(url, headers, timeout=15):
+    """GET，同样走 CHECKIN_PROXY。返回 (http状态码, 文本)；网络异常时返回 (-1, 错误信息)。"""
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with _opener.open(req, timeout=timeout) as resp:
+            return resp.status, resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", "replace")
+    except Exception as e:  # noqa: BLE001
+        return -1, str(e)
+
+
 # ---------- 状态文件 ----------
 def load_json(name, default):
     try:

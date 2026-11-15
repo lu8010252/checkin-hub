@@ -7,10 +7,8 @@
 import json
 import threading
 import time
-import urllib.error
-import urllib.request
 
-from common import bj_now, log, post_json, save_config
+from common import bj_now, get_json_text, log, post_json, save_config
 
 API = "https://copilot.tencent.com"
 HDR = {
@@ -28,17 +26,11 @@ _lock = threading.Lock()
 
 
 def _get(url, timeout=15):
-    req = urllib.request.Request(url, headers=HDR, method="GET")
+    st, text = get_json_text(url, HDR, timeout)  # 走 CHECKIN_PROXY，和其它请求一致
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8", "replace"))
-    except urllib.error.HTTPError as e:
-        try:
-            return json.loads(e.read().decode("utf-8", "replace"))
-        except Exception:  # noqa: BLE001
-            return {"code": -1, "msg": "http %s" % e.code}
-    except Exception as e:  # noqa: BLE001
-        return {"code": -1, "msg": str(e)[:120]}
+        return json.loads(text)
+    except Exception:  # noqa: BLE001
+        return {"code": -1, "msg": "http %s %s" % (st, text[:80])}
 
 
 def new_state():

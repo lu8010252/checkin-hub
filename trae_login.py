@@ -7,6 +7,7 @@ Trae 授权页只接受 127.0.0.1 的回调（实测改成盒子地址会直接�
 import base64
 import hashlib
 import json
+import re
 import secrets
 import time
 import urllib.parse
@@ -36,6 +37,16 @@ def new_session():
                       "status": "waiting", "msg": "等待脚本运行…"}
     _gc()
     return sid
+
+
+SID_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
+BOX_RE = re.compile(r"^https?://[A-Za-z0-9.\-]+(:\d{1,5})?$")
+
+
+def valid_sid(sid):
+    """sid 必须是本机生成过、没过期的会话，并且只含安全字符。"""
+    s = _sessions.get(sid or "")
+    return bool(SID_RE.match(sid or "") and s and time.time() - s["ts"] <= TTL)
 
 
 def status(sid):
@@ -98,8 +109,10 @@ def login_url(sid):
 def complete(sid, query):
     """脚本把回调参数原样转过来，这里换令牌并落盘。"""
     s = _sessions.get(sid)
-    if not s:
+    if not s or not valid_sid(sid):
         return False, "登录会话不存在或已过期"
+    if s["status"] == "ok":
+        return True, s["msg"]
     params = urllib.parse.parse_qs(query or "", keep_blank_values=True)
     code = ""
     try:
@@ -156,8 +169,8 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-BOX = "__BOX__"
-SID = "__SID__"
+BOX = __BOX__
+SID = __SID__
 PORT = 8931
 
 
@@ -237,7 +250,12 @@ if __name__ == "__main__":
 
 
 def script_text(box, sid):
-    return SCRIPT.replace("__BOX__", box.rstrip("/")).replace("__SID__", sid)
+    """生成给用户下载的脚本。box/sid 都经过校验，并用 json.dumps 转成安全的字符串字面量，
+    防止有人构造链接往脚本里注入代码。校验不过返回 None。"""
+    box = (box or "").rstrip("/")
+    if not BOX_RE.match(box) or not valid_sid(sid):
+        return None
+    return SCRIPT.replace("__BOX__", json.dumps(box)).replace("__SID__", json.dumps(sid))
 
 
 def render(csrf, sid=""):
@@ -247,7 +265,7 @@ def render(csrf, sid=""):
     head = '<div class="card"><h2>Trae 一键登录</h2>'
     steps = ('<ol class="mut" style="margin:6px 0 0 18px;padding:0">'
              '<li>下载下面的登录脚本（就一个 .py 文件）</li>'
-             '<li>在你自己电脑上双击运行（需要装了 Python；没装的话跟我说，我给你个免安装版）</li>'
+             '<li>在你自己电脑上双击运行（需要电脑装了 Python 3）</li>'
              '<li>浏览器会自动打开 Trae 登录页，登录完令牌自动写回盒子</li></ol>')
     again = ('<form method="post" action="/login/trae"><input type="hidden" name="csrf" value="%s">'
              '<button class="btn" type="submit">重新生成脚本</button></form>') % E(csrf)
