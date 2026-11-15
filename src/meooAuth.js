@@ -27,6 +27,12 @@ const CALLBACK_PATH = '/oauth/callback';
 
 const LOGIN_TIMEOUT_MS = 5 * 60_000;
 
+// 面板跑在 NAS/容器里时，浏览器那端的 127.0.0.1 根本到不了容器。
+// 设了 MEOO_CALLBACK_PORT 就固定端口并监听 0.0.0.0，
+// 配合 `ssh -L <port>:127.0.0.1:<port>` 把电脑的回环口接到容器上；
+// redirect_uri 仍是 127.0.0.1（服务端只校验这个字符串，不校验监听地址）。
+const FIXED_PORT = Number(process.env.MEOO_CALLBACK_PORT || 0) || 0;
+
 const sessions = new Map();
 
 function gcSessions() {
@@ -92,14 +98,15 @@ function finish(session) {
   setTimeout(() => { try { session.server.close(); } catch {} }, 500).unref();
 }
 
-/** 随机回环端口（CLI listen(0) 同款） */
+/** 随机回环端口（CLI listen(0) 同款）；配置了 MEOO_CALLBACK_PORT 则用固定端口监听全网卡 */
 async function bindLoopback(server) {
   await new Promise((resolve, reject) => {
     const onErr = (e) => { server.off('listening', onOk); reject(e); };
     const onOk = () => { server.off('error', onErr); resolve(); };
     server.once('error', onErr);
     server.once('listening', onOk);
-    server.listen(0, '127.0.0.1');
+    if (FIXED_PORT) server.listen(FIXED_PORT, '0.0.0.0');
+    else server.listen(0, '127.0.0.1');
   });
   return server.address().port;
 }

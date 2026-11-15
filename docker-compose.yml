@@ -11,9 +11,12 @@ services:
       - TZ=Asia/Shanghai
       - CREDITDADDY_HOME=/data
       - CREDITDADDY_PASSWORD=改成你的面板密码
+      # 面板不在本机时要走 OAuth 登录（如 Meoo），把头两个改成实际值：
+      # - MEOO_CALLBACK_PORT=17777   # 固定回调端口，配合 ssh -L 把电脑回环口接过来
       # - CREDITDADDY_NTFY_URL=https://ntfy.sh/your-topic   # 签到结果推到这里
       # - CREDITDADDY_NTFY_TOKEN=tk_xxx                     # 自建 ntfy 需要鉴权时填
     ports:
       - "47861:47860"   # 面板：http://服务器IP:47861
+      # - "17777:17777" # Meoo OAuth 回调（配合 MEOO_CALLBACK_PORT 与 ssh -L）
     volumes:
       - ./data:/data    # 账号、令牌、日志都在这里，别删
