@@ -50,7 +50,9 @@ python trae_get_token.py                 # 打印 TRAE_REFRESH_TOKEN
 python trae_get_token.py --export-keys   # 打印 TRAE_DEVICE_KEY_PEM / TRAE_DEVICE_PUB_PEM / TRAE_DEVICE_ID / TRAE_MACHINE_ID
 ```
 
-把 5 项填进网页「设置」的 Trae 部分。PEM 可以直接粘贴多行，也可以是一行里用 `\n` 代替换行。如果提示缺 `cryptography`，`pip install cryptography` 即可（只在导出这一步需要）。
+脚本只用 Python 标准库，不用装任何包；它读取 Trae 客户端本地的 `storage.json`（Windows 在 `%APPDATA%\Trae CN\User\globalStorage\`，macOS 在 `~/Library/Application Support/Trae CN/User/globalStorage/`），所以要先在这台电脑上登录过 Trae。
+
+把 5 项填进网页「设置」的 Trae 部分。PEM 可以直接粘贴多行，也可以是一行里用 `\n` 代替换行。输出里有令牌和设备私钥，别发给别人、别贴到公开的地方。
 
 ## 注意
 
