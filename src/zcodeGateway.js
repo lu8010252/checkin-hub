@@ -1,0 +1,850 @@
+/**
+ * ZCode 免费额度网关 — Start Plan 体验包（GLM-5.3-Flash）的本地补全代理。
+ *
+ * 数据面：POST /gateway/zcode/v1/messages（Anthropic /v1/messages 形态，10router
+ * 建一个 anthropic-compatible 自定义节点指向这里即可）。
+ *
+ * 链路：账号轮转（store 里 provider=zcode、可解析出 zcodejwttoken 的账号；
+ *   每个请求换一个队首，多任务分摊到各账号，见 rotationQueue）
+ *   → 验证码（复用桌面版注册的隐藏窗口 provider，与活动领取共用同一个求解器）
+ *   → POST zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages
+ *   → SSE / JSON 原样流式回传。
+ *
+ * 失败分类：3007/3012（验证码）→ 作废 token 重解重试；401（JWT 失效）→ 拉黑账号；
+ * 402/额度不足 → 标记耗尽；429 → 冷却（退避阶梯 30s → 1min → 2min → 5min → 10min 封顶，成功即清零）。
+ * 全部失败返回 502 + 各账号结论。
+ *
+ * 仅限本机回路使用：daemon 只绑 127.0.0.1，网关不做鉴权（跨机场景需要先给
+ * daemon 加绑定/密钥，见 README）。NAS/纯 CLI 环境没有验证码提供者，网关开不了。
+ */
+
+import { claimToken, fetchCaptchaConfig, fetchJsonRace, fetchZcodeQuota } from './zcodeClient.js';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+// ZCode 客户端 plan 请求形状（从本机客户端真实流量捕获的载荷模板：系统提示词数组 +
+// currentDate 提醒块 + metadata 会话形状）。网关请求镜像此形状——这就是 405/3012 风控的通过票。
+// 提示词已脱敏（去掉抓包来源的用户路径/会话 id），避免把第三方隐私随请求外发（见 issue #16）。
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+let PLAN_SHAPE = null;
+try { PLAN_SHAPE = JSON.parse(readFileSync(path.join(__dirname, 'zcodePlanShape.json'), 'utf8')); } catch {}
+
+import { getZcodeCaptchaProvider } from './zcodeAutoClaim.js';
+import { gatewayHostSuggestion } from './tenrouter.js';
+
+// 整链补全提供者（桌面版注册）：隐藏窗口内「真 Chromium 求解验证码 + 同源发起补全」，
+// 规避 Node fetch 的 TLS 指纹风控。签名 ({ captchaCfg, jwt, rawBody }) → { status, contentType, body }。
+let completionProvider = null;
+export function setZcodeCompletionProvider(fn) { completionProvider = typeof fn === 'function' ? fn : null; }
+export function getZcodeCompletionProvider() { return completionProvider; }
+import { loadAccounts, loadSettings, saveSettings, loadState, withState } from './store.js';
+import crypto from 'node:crypto';
+import os from 'node:os';
+import { logger, summarizeAttempts } from './logger.js';
+import { t } from './i18n.js';
+import { formatDurationMs } from './formatDuration.js';
+
+const PLAN_MESSAGES_URL = 'https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages';
+const CAPTCHA_CACHE_TTL_MS = 30_000;
+const ACCOUNT_COOLING_MS = 5 * 60_000;   // 额度不足（402）等「非限流」失败的冷却
+const MAX_ATTEMPTS = 6;
+// 429 限流的退避阶梯：30s → 1min → 2min → 5min → 10min，之后一直停在 10min。
+// 前四档基本翻倍（上游限流窗口多在分钟级，起步 30s 能快速恢复），
+// 2min → 5min 那跳是陡的（×2.5）：说明再往后就是真被持续限流了，给到 10min 兜底后不再涨，
+// 避免「一直被限流的号」被永久排除在轮换之外。见 markRateLimited。
+const RATE_LIMIT_BACKOFF_MS = [30_000, 60_000, 120_000, 300_000, 600_000];
+// 上游补全墙钟上限（响应头到齐后 body 仍可流式跑这么久）
+const UPSTREAM_TIMEOUT_MS = 600_000;
+// 连接段（DNS/TCP/TLS/首字节）限时：上游黑洞挂死时几秒内换下一条路 / 代理兜底，
+// 而不是吊满 10 分钟——这是「网关很慢 / 卡住」体感的主要来源
+const UPSTREAM_CONNECT_MS = 15_000;
+
+// ── 开关（持久化在 settings.zcodeGateway） ──
+
+export async function gatewayEnabled() {
+  return (await loadSettings()).zcodeGateway === true;
+}
+
+export async function setGatewayEnabled(v) {
+  const on = v === true;
+  await saveSettings({ zcodeGateway: on });
+  // 开启网关视为「重新开始」：清掉进程内的拉黑/冷却状态，
+  // 否则重新登录导入后旧黑名单仍会把账号挡在轮换队列外（与 MiniMax 网关同款 bug）。
+  if (on) {
+    dead.clear();
+    cooling.clear();
+    coolingStreak.clear();
+  }
+}
+
+// ── 账号轮换状态（进程内；重启即清零） ──
+
+let rrIndex = 0;
+const cooling = new Map();  // accountId → 冷却截止(ms)
+// accountId → 连续 429 次数（成功即清零）：决定本次 429 走到退避阶梯的哪一档
+const coolingStreak = new Map();
+const dead = new Map();     // accountId → 拉黑时的凭据指纹（指纹变化 = 已重新登录导入，自动复活）
+// 会话粘滞（用户选 A）：sessionId → { accountId, at }。同一段对话的多轮固定用同一个号，
+// TTL 到期让位给轮转，避免冷会话长期占号。声明放这里是因为 __resetForTests 要清它。
+const sessionSticky = new Map();
+
+function markCooling(id, ms = ACCOUNT_COOLING_MS) { cooling.set(id, Date.now() + ms); }
+
+/**
+ * 429 限流：按连续次数走退避阶梯（30s → 1min → 2min → 5min → 10min 封顶）。
+ * 上游限流窗口通常在分钟级，从 30s 起步能快速恢复，又不会像固定 5 分钟那样
+ * 一直撞在限流窗口里（日志里清一色「冷却 5 分钟」就是这么来的）。
+ * 成功时 resetCoolingStreak 清零，所以偶发 429 不会累积。
+ */
+function markRateLimited(id) {
+  const streak = (coolingStreak.get(id) || 0) + 1;
+  coolingStreak.set(id, streak);
+  const ms = RATE_LIMIT_BACKOFF_MS[Math.min(streak, RATE_LIMIT_BACKOFF_MS.length) - 1];
+  cooling.set(id, Date.now() + ms);
+  return ms;
+}
+
+/** 账号补全成功：清零连续 429 计数（下次 429 重新从 30 秒起算） */
+function resetCoolingStreak(id) { coolingStreak.delete(id); }
+
+/**
+ * 账号被删除时清掉它在各轮换 Map 里的残留（daemon DELETE /api/accounts/:id 调用）。
+ * 账号 id 每次导入都是新 UUID，删了不清理的话这些条目永远不会被任何人再触碰。
+ */
+export function forgetAccount(id) {
+  cooling.delete(id);
+  coolingStreak.delete(id);
+  dead.delete(id);
+  quotaCache.delete(id);
+  for (const [k, v] of sessionSticky) if (v?.accountId === id) sessionSticky.delete(k);
+}
+
+/**
+ * 测试专用：把某账号的冷却截止拨到指定时间戳（0 = 立即到期，用于快进冷却窗口）。
+ * 生产不走这里——冷却窗口只能自然到期。
+ */
+export function __setCoolingForTests(accountId, untilMs) { cooling.set(accountId, untilMs); }
+
+/** 测试专用：清空进程内轮换/冷却/拉黑/验证码缓存/统计状态 */
+export function __resetForTests() {
+  rrIndex = 0;
+  cooling.clear();
+  coolingStreak.clear();
+  dead.clear();
+  quotaCache.clear();
+  sessionSticky.clear();
+  marksHydrated = false;
+  captchaCache = null;
+  stats.lastCallAt = null;
+  stats.calls = 0;
+  stats.lastAccount = null;
+  recentEntries.length = 0;
+}
+function markDead(account) {
+  dead.set(account.id, credFingerprint(account));
+  cooling.set(account.id, Number.MAX_SAFE_INTEGER);
+}
+
+/** 拉黑时的凭据指纹：重新登录/重新导入会整体替换 meta.credentials，指纹变化即可复活 */
+function credFingerprint(a) {
+  return `${a.meta?.credentials?.zcodejwttoken || ''}|${a.token || ''}`;
+}
+
+/**
+ * 账号是否仍处于拉黑状态。拉黑记的是「当时那份凭据」的指纹：
+ * 重新登录导入换了 JWT 后指纹不匹配 → 自动复活（清黑名单与冷却）。
+ */
+function isDead(account) {
+  const fp = dead.get(account.id);
+  if (fp === undefined) return false;
+  if (fp === credFingerprint(account)) return true;
+  dead.delete(account.id);
+  cooling.delete(account.id);
+  coolingStreak.delete(account.id);
+  logger.info('ZCODE-GW', '{label} 凭据已更新,解除拉黑', { label: account.name || account.uid || account.id });
+  return false;
+}
+
+/**
+ * 可参与轮换的账号（有可解析 plan JWT、未冷却/未拉黑），队首 = 本次主用号。
+ * @param {string|null} sessionId 调用方带来的会话标识；命中粘滞时该号优先
+ */
+async function rotationQueue(sessionId = null) {
+  const all = (await loadAccounts()).filter((a) => a.provider === 'zcode');
+  await hydrateMarks();
+  const now = Date.now();
+  const ready = [];
+  for (const a of all) {
+    if (isDead(a)) continue;
+    if (isQuotaExhausted(a.id)) continue; // 0 额度打标，不再轮换
+    if ((cooling.get(a.id) || 0) > now) continue;
+    try { claimToken(a); ready.push(a); } catch { /* 快照里没有 plan JWT，跳过 */ }
+  }
+  if (!ready.length) return [];
+
+  // 会话粘滞优先：同一段对话的多轮固定用同一个号（用户选 A）。
+  // 粘住的号必须仍在可用集里——被拉黑/冷却/打标后粘滞自动让位给轮转。
+  if (sessionId) {
+    const pinned = stickyFor(sessionId);
+    if (pinned) {
+      const hit = ready.find((a) => a.id === pinned);
+      if (hit) return [hit, ...ready.filter((a) => a.id !== pinned)];
+    }
+  }
+
+  // 轮转：每个请求换一个队首，让多任务分摊到各账号（rrIndex 是「下一轮的起点」，
+  // 每轮自增 1）。老实现只把 rrIndex 归一化到 ready.length 内、从不自增，
+  // 于是队首恒为账号库里的第一个号——「多任务全走一个账号」就是这么来的。
+  const start = rrIndex % ready.length;
+  rrIndex += 1;
+  return [...ready.slice(start), ...ready.slice(0, start)];
+}
+
+/** 队列为空时说清原因（与 rotationQueue 同序分类）——额度耗尽不该提示「重新登录导入」 */
+async function unavailableReason() {
+  const all = (await loadAccounts()).filter((a) => a.provider === 'zcode');
+  if (!all.length) return '没有 ZCode 账号：请在 ZCode 登录后本机导入';
+  const now = Date.now();
+  const n = { dead: 0, exhausted: 0, cooling: 0, noJwt: 0 };
+  for (const a of all) {
+    if (isDead(a)) n.dead++;
+    else if (isQuotaExhausted(a.id)) n.exhausted++;
+    else if ((cooling.get(a.id) || 0) > now) n.cooling++;
+    else n.noJwt++; // 未拉黑/未打标/未冷却却不在队列 → 快照里没有可解析的 plan JWT
+  }
+  if (n.noJwt === all.length) {
+    return '没有可用的 ZCode 账号（需要账号快照里有 zcodejwttoken：在 ZCode 重新登录后本机导入）';
+  }
+  const parts = [];
+  if (n.exhausted) parts.push(`${n.exhausted} 个额度耗尽（${Math.round(QUOTA_TTL_MS / 60_000)} 分钟内自动重探，无需重新登录）`);
+  if (n.cooling) parts.push(`${n.cooling} 个临时冷却中（稍后自动恢复）`);
+  if (n.dead) parts.push(`${n.dead} 个 JWT 已失效（需在 ZCode 重新登录后本机导入）`);
+  if (n.noJwt) parts.push(`${n.noJwt} 个缺少 zcodejwttoken（需在 ZCode 重新登录后本机导入）`);
+  return `没有可用的 ZCode 账号：${parts.join('；')}`;
+}
+
+// ── 验证码（与活动领取共用桌面版隐藏窗口求解器；30s 内复用同一 token） ──
+
+let captchaCache = null; // { param, region, at }
+
+// 调用统计（进程内）：面板「10Router 已接入」活标签的数据源
+const stats = { lastCallAt: null, calls: 0, lastAccount: null };
+const RECENT_ACCOUNTS_MAX = 4;   // 面板「接口使用中」徽标的覆盖范围：窗口内最近服役过的前 N 个号
+// 「接口使用中」只认近 30 分钟内真正服役过的号（2026-11-07 用户反馈：无时间衰减时
+// 调用过一次的号永远挂着徽章，四张卡全亮，看起来像只剩一个号在轮转）。
+const RECENT_WINDOW_MS = 30 * 60_000;
+const recentEntries = [];   // { label, at } 最新在前，按 label 去重（保留最新一次）
+function recordRecentAccount(label, at = Date.now()) {
+  if (!label) return;
+  recentEntries.unshift({ label, at });
+  const seen = new Set();
+  for (let i = recentEntries.length - 1; i >= 0; i--) {
+    if (seen.has(recentEntries[i].label)) recentEntries.splice(i, 1);
+    else seen.add(recentEntries[i].label);
+  }
+  if (recentEntries.length > 32) recentEntries.length = 32;
+}
+/** 窗口内的服役名单（最新在前、去重、封顶）：gatewayStatus.recentAccounts 的口径。 */
+export function recentLabelsInWindow(entries, now = Date.now(), windowMs = RECENT_WINDOW_MS, cap = RECENT_ACCOUNTS_MAX) {
+  const seen = new Set();
+  const out = [];
+  for (const e of entries) {
+    if (!e || typeof e.at !== 'number' || now - e.at > windowMs) continue;
+    if (seen.has(e.label)) continue;
+    seen.add(e.label);
+    out.push(e.label);
+    if (out.length >= cap) break;
+  }
+  return out;
+}
+/** 测试专用：注入指定时间的服役记录（控制窗口过滤的新旧）。 */
+export function _recordRecentForTests(label, at) {
+  recordRecentAccount(label, at);
+}
+
+// 额度打标：0 额度账号不再轮换（额度缓存 10 分钟，到期自动重探；
+// 1005/1113 失败时也会即时探测确认——剩余>0 视为瞬时错误继续用）
+const QUOTA_TTL_MS = 10 * 60_000;
+const quotaCache = new Map(); // accountId → { remaining, at }
+
+let marksHydrated = false;
+async function hydrateMarks() {
+  if (marksHydrated) return;
+  marksHydrated = true;
+  try {
+    const st = await loadState();
+    const saved = st?.zcodeGatewayExhausted || {};
+    for (const [id, e] of Object.entries(saved)) {
+      if (e && Date.now() - e.at < QUOTA_TTL_MS && !quotaCache.has(id)) quotaCache.set(id, e);
+    }
+  } catch { /* 状态读不到就从零开始 */ }
+}
+
+async function persistMark(accountId, entry) {
+  try {
+    await withState((st) => {
+      st.zcodeGatewayExhausted = { ...(st.zcodeGatewayExhausted || {}), [accountId]: entry };
+    });
+  } catch { /* 持久化失败不影响内存态 */ }
+}
+
+/**
+ * 账号刚领到新额度（活动领取成功）：清掉耗尽打标（内存 + state.json）和额度不足导致的冷却，
+ * 让它立刻回到轮换——否则要等打标 10 分钟 / 冷却 30 分钟到期。JWT 拉黑不受影响。
+ */
+export async function clearQuotaMark(accountId) {
+  quotaCache.delete(accountId);
+  if (!dead.has(accountId)) cooling.delete(accountId);
+  resetCoolingStreak(accountId);   // 领到新额度 = 状态已恢复，429 计数重新从 30 秒起算
+  try {
+    await withState((st) => {
+      if (st?.zcodeGatewayExhausted?.[accountId]) delete st.zcodeGatewayExhausted[accountId];
+    });
+  } catch { /* 持久化失败不影响内存态 */ }
+}
+
+function isQuotaExhausted(id) {
+  const q = quotaCache.get(id);
+  return Boolean(q && Date.now() - q.at < QUOTA_TTL_MS && q.remaining <= 0);
+}
+
+async function probeQuota(account) {
+  const r = await fetchZcodeQuota(account).catch(() => null);
+  const remaining = Number(r?.remaining);
+  if (Number.isFinite(remaining)) {
+    quotaCache.set(account.id, { remaining, at: Date.now() });
+    return remaining;
+  }
+  return null;
+}
+
+async function ensureCaptcha(force = false) {
+  if (!force && captchaCache && Date.now() - captchaCache.at < CAPTCHA_CACHE_TTL_MS) return captchaCache;
+  const provider = getZcodeCaptchaProvider();
+  if (!provider) {
+    throw Object.assign(new Error('本环境没有验证码提供者（网关补全需要桌面版 CreditDaddy 运行）'), { code: 'NO_CAPTCHA_PROVIDER' });
+  }
+  const cfg = await fetchCaptchaConfig();
+  if (!cfg.enabled || !cfg.sceneId) {
+    throw Object.assign(new Error('验证码配置不可用'), { code: 'NO_CAPTCHA_CONFIG' });
+  }
+  const { captchaParam, region } = await provider(cfg);
+  captchaCache = { param: captchaParam, region, at: Date.now() };
+  return captchaCache;
+}
+
+function invalidateCaptcha() { captchaCache = null; }
+
+// ── 数据面 ──
+
+/** 友好化上游错误描述 */
+function formatUpstreamError(status, text) {
+  const content = String(text || '').trim();
+
+  // HTML 错误页面 → 提取关键信息
+  if (content.includes('<html>') || content.includes('<h1>')) {
+    const titleMatch = content.match(/<h1[^>]*>(.*?)<\/h1>/i);
+    if (titleMatch) return `HTML 错误页：${titleMatch[1].trim()}`;
+    return 'HTML 错误页（上游服务异常）';
+  }
+
+  // JSON 错误 → 提取业务码和消息
+  try {
+    const json = JSON.parse(content);
+    const codes = [json.code, json.status, json.error?.code];
+    const codeStr = codes.find(c => typeof c === 'number');
+    const msg = json.message || json.error?.message || '';
+    return codeStr ? (msg ? `[code:${codeStr}] ${msg}` : `[code:${codeStr}]`) : '未知错误';
+  } catch {
+    // 普通文本错误 → 截断显示
+    const preview = content.length > 60 ? `${content.slice(0, 60)}...` : content;
+    return preview || '(无响应内容)';
+  }
+}
+
+function readRawBody(req, limitBytes = 20 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > limitBytes) {
+        // 只 pause 不 destroy：destroy 会把 socket 打死，调用方随后写的 413 就发不出去，
+        // 客户端只看到 ECONNRESET，分不清「自己请求体写太大」和「网络断了」。
+        // 响应写完（res 'finish'）再由调用方收尾断开。
+        req.pause();
+        reject(Object.assign(new Error(`request body too large (limit ${Math.floor(limitBytes / 1024 / 1024)}MB)`), { status: 413 }));
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+
+// 业务码可能包在 HTTP 200 里（上游对部分错误回 200 + {code}），两类都要看。
+// 裸数字必须加 \b 词边界：否则 "code":4010 会被当成 401 认证失败（→ 账号被永久拉黑），
+// 耗时 10050ms / request-id=11137 / 30071 也会被当成额度耗尽或验证码（→ 冷却 30 分钟 / 空跑一次验证码）。
+const isCaptchaError = (status, text) =>
+  status === 405 || /"code"\s*:\s*(3007|3012)\b|\b(3007|3012)\b|captcha|unusual activity/i.test(text);
+
+const isAuthError = (status, text) =>
+  status === 401 || /"code"\s*:\s*401\b|\b401\b|令牌已过期|验证不正确/.test(text);
+
+const isExhausted = (status, text) =>
+  status === 402 || /"code"\s*:\s*(1005|1113)\b|\b(1113|1005)\b|余额不足|无可用资源包|exceed quota|insufficient/i.test(text);
+
+// 上游成功也会带 code（0 / 200），别把它们当业务错误——与 zcodeClient.businessOk 同一口径
+const BUSINESS_OK = new Set([0, 200]);
+
+/**
+ * 从调用方 body 的 metadata 里取会话标识。宽容解析三种形状：
+ *   {"user_id": "{\"session_id\":\"ses_x\",\"account_uuid\":\"...\"}"}   （上游同形，最常见）
+ *   {"session_id": "ses_x"}                                             （裸字段）
+ *   {"user_id": "ses_x"}                                                （字符串直给）
+ * @returns {{sessionId: string|null, accountUuid: string|null}}
+ */
+export function parseSessionMeta(metadata) {
+  const out = { sessionId: null, accountUuid: null };
+  if (!metadata || typeof metadata !== 'object') return out;
+  // 顶层直给的会话字段也算（调用方可能直接放 metadata.session_id）
+  out.sessionId = String(metadata.session_id || metadata.conversation_id || metadata.chat_id || '').slice(0, 64) || null;
+  const uid = metadata.user_id ?? metadata.userId ?? metadata.user;
+  let obj = null;
+  if (typeof uid === 'object') obj = uid;
+  else if (typeof uid === 'string') {
+    const s = uid.trim();
+    if (!s) return out;
+    if (s.startsWith('{')) {
+      try { obj = JSON.parse(s); } catch { out.sessionId = s.slice(0, 64); return out; }
+    } else out.sessionId = s.slice(0, 64);
+  }
+  if (obj && typeof obj === 'object') {
+    out.sessionId = String(obj.session_id || obj.sessionId || obj.conversation_id || obj.chat_id || out.sessionId || '').slice(0, 64) || out.sessionId;
+    out.accountUuid = String(obj.account_uuid || obj.accountUuid || '').slice(0, 64) || null;
+  }
+  return out;
+}
+
+// ── 会话粘滞：同一会话的多轮对话固定用同一个号 ──
+// 用户选 A：同一段对话不跳号（跳号会让上下文承接出现割裂），新会话才轮转。
+// 只粘「活着的」会话：TTL 到期即让位给轮转，避免某个冷会话长期占着一个号不放。
+const SESSION_STICKY_TTL_MS = 30 * 60_000;
+
+/** 取会话当前粘住的号（过期即失效） */
+function stickyFor(sessionId) {
+  const e = sessionSticky.get(sessionId);
+  if (!e) return null;
+  if (Date.now() - e.at >= SESSION_STICKY_TTL_MS) {
+    sessionSticky.delete(sessionId);
+    return null;
+  }
+  return e.accountId;
+}
+
+/** 会话粘住的号仍可用才粘；否则落到轮转队首，由调用方重新绑定 */
+function touchSticky(sessionId, accountId) {
+  if (!sessionId) return;
+  // 每段对话一个新 session id，安静会话的条目只有等它自己再被查到才会过期——
+  // 长期运行的网关上单调增长。超阈值时整表清一遍过期项。
+  if (sessionSticky.size > 500) {
+    const now = Date.now();
+    for (const [k, v] of sessionSticky) if (now - (v?.at || 0) >= SESSION_STICKY_TTL_MS) sessionSticky.delete(k);
+  }
+  sessionSticky.set(sessionId, { accountId, at: Date.now() });
+}
+/** 从上游 JSON 信封里取业务码；字符串数字（"3007"）也认，取不到返回 null */
+function businessCode(v) {
+  if (!v || typeof v !== 'object' || v.code === undefined || v.code === null) return null;
+  const n = Number(v.code);
+  return Number.isFinite(n) ? n : null;
+}
+// 组装与 ZCode 客户端真实流量一致的 plan 请求（镜像 R1 捕获，2026-09-29）
+function buildPlanRequest(rawBody, { token, userId }) {
+  const ver = '3.14.3';
+  let bodyObj;
+  try { bodyObj = JSON.parse(rawBody); } catch { bodyObj = null; }
+  if (!bodyObj || typeof bodyObj !== 'object') bodyObj = { model: 'glm-5.3-flash', messages: [] };
+  const rawMeta = parseSessionMeta(bodyObj.metadata);
+  // 客户端形状：system = ZCode 系统提示词数组；首条 user 消息前插 currentDate 提醒块；
+  // metadata.user_id = 会话形状字符串
+  if (PLAN_SHAPE) {
+    bodyObj.system = PLAN_SHAPE.system;
+    const msgs = Array.isArray(bodyObj.messages) ? bodyObj.messages : [];
+    const reminderText = PLAN_SHAPE.reminderText
+      ? PLAN_SHAPE.reminderText.replace(/Today's date is [^.]+\./, `Today's date is ${new Date().toISOString().slice(0, 10)}.`)
+      : null;
+    if (reminderText) {
+      const first = msgs[0];
+      const firstIsUser = first?.role === 'user';
+      const already = firstIsUser && typeof first.content === 'string' && first.content.includes('<system-reminder>');
+      if (!already) {
+        const block = { type: 'text', text: reminderText };
+        if (firstIsUser && Array.isArray(first.content)) first.content = [block, ...first.content];
+        else if (firstIsUser) first.content = [block, { type: 'text', text: String(first.content ?? '') }];
+        else msgs.unshift({ role: 'user', content: [block, { type: 'text', text: '.' }] });
+      }
+      bodyObj.messages = msgs;
+    }
+    // 会话标识：调用方传了就原样透传（会话粘滞的锚点），没传才随机生成。
+    // 注意上游只认这一个字段——网关此前每次都 new 一个新 session_id，
+    // 于是上游眼里每请求都是新会话，同一段对话的上下文连续性也丢了。
+    bodyObj.metadata = {
+      user_id: JSON.stringify({
+        account_uuid: rawMeta?.accountUuid || '',
+        session_id: rawMeta?.sessionId || 'ses_' + crypto.randomUUID().slice(0, 16),
+      }),
+    };
+  }
+  const headers = {
+    'Content-Type': 'application/json',
+    Accept: '*/*',
+    'accept-encoding': 'identity', // 网关不做压缩透传——转发链上有字符串化环节，gzip 字节会损坏
+    'User-Agent': `ZCode/${ver} ai-sdk/anthropic/3.0.81`,
+    'X-ZCode-App-Version': ver,
+    'X-ZCode-Agent': 'glm',
+    'X-Title': 'Z Code@cli',
+    'HTTP-Referer': 'https://zcode.z.ai',
+    'X-Client-Language': 'zh-CN',
+    'X-Client-Timezone': Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Shanghai',
+    'X-Platform': 'win32-x64',
+    'X-Os-Category': 'windows',
+    'X-Os-Version': os.release?.() || '10.0.19045',
+    'X-Release-Channel': 'production',
+    'x-zcode-session-type': 'main',
+    'x-zcode-trace-id': crypto.randomUUID(),
+    'x-request-id': crypto.randomUUID(),
+    'anthropic-version': '2023-06-01',
+    Authorization: `Bearer ${token}`,
+  };
+  return { headers, body: JSON.stringify(bodyObj) };
+}
+
+const LOOPBACK_RE = /^(::1|::ffff:127\.0\.0\.1|127\.0\.0\.1)$/;
+function isLoopbackRemote(remote) {
+  return !remote || LOOPBACK_RE.test(String(remote));
+}
+
+/** 规范化远端地址（剥 IPv4-mapped IPv6 前缀），与白名单条目比对 */
+export function remoteHost(remote) {
+  return String(remote || '').replace(/^::ffff:/i, '').trim();
+}
+
+/** 白名单匹配：精确 IP / 主机名，或 `*` 结尾的前缀通配（如 192.168.31.*） */
+export function remoteAllowed(remote, allowList) {
+  const host = remoteHost(remote);
+  if (!host) return false;
+  return (Array.isArray(allowList) ? allowList : []).some((entry) => {
+    const e = String(entry || '').trim();
+    if (!e) return false;
+    if (e.endsWith('*')) {
+      // 通配要求带点段尾：防止 192.168.31.1* 这类把 .100-.199 整段一起放行的怪手。
+      // 要扩整段子网，把写法统一为 192.168.31.*（带尾句点）。
+      const prefix = e.slice(0, -1);
+      if (!prefix.endsWith('.')) return false;
+      return host.toLowerCase().startsWith(prefix.toLowerCase());
+    }
+    return host.toLowerCase() === e.toLowerCase();
+  });
+}
+
+/**
+ * 网关数据面入口。返回 true 表示响应已写出（含失败结论）。
+ *
+ * 访问控制：本机回环始终放行；开局域网后仅 IP 白名单内的机器可访问——
+ * zcode-free 本就是 10Router 侧免授权供应商，10Router 所在机器加白即可，不再保留虚拟 key 鉴权。
+ */
+export async function handleGateway(req, res) {
+  if (req.method !== 'POST') {
+    res.writeHead(405, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ error: 'POST /gateway/zcode/v1/messages（Anthropic /v1/messages 形态）' }));
+  }
+  // settings 一次读齐：开关 + 局域网鉴权共用，省掉一次 settings.json 磁盘读（热路径每请求都走）
+  const settings = await loadSettings();
+  if (settings.zcodeGateway !== true) {
+    res.writeHead(503, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ error: 'ZCode 免费额度网关未开启（面板 → ZCode → 网关开关）' }));
+  }
+  // 首发不带验证码（客户端真实流量多数直过），所以纯 daemon / NAS 也能用；
+  // 只有当上游索要验证码且本环境没有求解提供者时才失败（见 attempts 汇总）。
+
+  // 鉴权：本机回环免密；开局域网后仅白名单内 IP 免密直连（如 10Router 所在机器——zcode-free 本就是免授权供应商）
+  const remote = (req.socket && req.socket.remoteAddress) || '';
+  if (!isLoopbackRemote(remote)) {
+    if (settings.zcodeGatewayLan !== true) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: '网关未允许局域网访问（面板 → ZCode → 接口设置）' }));
+    }
+    if (!remoteAllowed(remote, settings.zcodeGatewayAllow)) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: `来源 ${remoteHost(remote) || '未知'} 不在网关 IP 白名单内（面板 → ZCode → 接口设置里添加）` }));
+    }
+  }
+
+  let rawBody;
+  try { rawBody = await readRawBody(req); } catch (e) {
+    res.writeHead(e.status || 400, { 'Content-Type': 'application/json' });
+    // 超限时请求体还没读完：先把 413 发出去，发完再断开，避免客户端继续往这灌数据
+    res.on('finish', () => req.destroy());
+    return res.end(JSON.stringify({ error: e.message }));
+  }
+
+  // 会话标识在 body 里（不在头里）：客户端/10Router 若传了 metadata.user_id
+  // 就作为粘滞锚点；没传则 sessionId 为 null，纯轮转。
+  let sessionId = null;
+  try {
+    const parsed = JSON.parse(rawBody);
+    sessionId = parseSessionMeta(parsed?.metadata)?.sessionId;
+  } catch { /* 非 JSON 体走轮转 */ }
+
+  const queue = await rotationQueue(sessionId);
+  if (!queue.length) {
+    res.writeHead(503, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ error: await unavailableReason() }));
+  }
+
+  stats.lastCallAt = new Date().toISOString();
+  stats.calls += 1;
+
+  const attempted = [];
+  // 客户端断开 → 取消当前上游请求。整个重试循环共用一个 controller/listener：
+  // 放在循环里每轮 new + req.on('close') 会在同一 req 上累积最多 MAX_ATTEMPTS 个监听器
+  // （MaxListenersExceededWarning + 泄漏）。
+  const clientAbort = new AbortController();
+  req.once('close', () => { if (!res.writableEnded) clientAbort.abort(); });
+  // 优雅断开（客户端 fetch abort 在上游响应前）只触发 res 'close'，不触发 req 'close'
+  // ——少这一个钩子，Ctrl+C 后整个重试循环（含验证码求解、账号轮换）还在为已死的客户端空跑
+  res.once('close', () => { if (!res.writableEnded) clientAbort.abort(); });
+  // 首发不带验证码（客户端真实流量多数直过）；上游 3007/403 时求解并在此后的
+  // 尝试上挂新 token（zcode-api 同策略）。provider 为 null（NAS/CLI）时首过路径依然可用。
+  let captcha = null;
+  for (let i = 0; i < Math.min(MAX_ATTEMPTS, queue.length * 2); i++) {
+    const account = queue[i % queue.length];
+    // 本轮已被打标/冷却/拉黑的号不再重打（第二圈只为验证码重试准备）
+    if (isDead(account) || isQuotaExhausted(account.id) || (cooling.get(account.id) || 0) > Date.now()) continue;
+    const label = account.name || account.uid || account.id;
+    let token;
+    try { token = claimToken(account); } catch (e) {
+      attempted.push({ account: label, ok: false, error: e.message });
+      markDead(account);
+      continue;
+    }
+
+    let upstream;
+    try {
+      // 请求面完全镜像 ZCode 客户端真实流量（R1 捕获）：全套 identity 头 + 客户端
+      // 系统提示词/提醒块/metadata 形状。验证码不预挂——服务端未风控时直过；
+      // 返回 3007/403 再求解挂上重试（zcode-api 同策略）。
+      const built = buildPlanRequest(rawBody, { token, userId: account.uid });
+      const headers = captcha
+        ? { ...built.headers, 'X-Aliyun-Captcha-Verify-Param': captcha.param, 'X-Aliyun-Captcha-Verify-Region': captcha.region }
+        : built.headers;
+      upstream = await fetchJsonRace(PLAN_MESSAGES_URL, {
+        method: 'POST',
+        headers,
+        body: built.body,
+        timeoutMs: UPSTREAM_TIMEOUT_MS,
+        connectMs: UPSTREAM_CONNECT_MS,
+        signal: clientAbort.signal,
+      });
+    } catch (e) {
+      if (clientAbort.signal.aborted) return; // 客户端先断了
+      attempted.push({ account: label, ok: false, error: e.message });
+      continue;
+    }
+
+    if (upstream.ok) {
+      // 上游会把业务错误包在 HTTP 200 + application/json 里（非 SSE）——先验形再转发，
+      // 否则客户端拿到「200 但不是 Message」的假成功（cc CLI 的 StreamNoEventsError 就是它）
+      const ct = (upstream.headers.get('content-type') || '').toLowerCase();
+      if (ct.includes('application/json')) {
+        const text = await upstream.text().catch(() => '');
+        let v;
+        try { v = JSON.parse(text); } catch { v = null; }
+        const code = businessCode(v);
+        // 上游成功信封也可能带 code（0 / 200），那不是业务错误；字符串数字（"3007"）同样要拦
+        if (code !== null && !BUSINESS_OK.has(code)) {
+          if (isCaptchaError(200, text)) {
+            invalidateCaptcha();
+            attempted.push({ account: label, ok: false, error: '验证码被拒（200 业务码）', captcha: true });
+            try { captcha = await ensureCaptcha(true); } catch { captcha = null; }
+            continue;
+          }
+          if (isAuthError(200, text)) {
+            markDead(account);
+            attempted.push({ account: label, ok: false, error: 'JWT 已失效，账号拉黑' });
+            logger.warn('ZCODE-GW', '{label} JWT 失效(200 业务码)', { label });
+            continue;
+          }
+          if (isExhausted(200, text)) {
+            const remaining = await probeQuota(account).catch(() => null);
+            if (remaining === null) {
+              // 探不到额度 ≠ 确认耗尽：不打标（否则一次查询失败就把号挡 10 分钟），只短冷却
+              markCooling(account.id, 2 * 60_000);
+              attempted.push({ account: label, ok: false, error: '额度被拒且额度查询失败，短冷却' });
+            } else if (remaining <= 0) {
+              // 确认 0 额度 → 打标（持久化到 state.json，重启不复轮换）
+              const entry = { remaining, at: Date.now() };
+              quotaCache.set(account.id, entry);
+              await persistMark(account.id, entry);
+              attempted.push({ account: label, ok: false, error: `额度耗尽（剩余 ${remaining}），已打标` });
+            } else {
+              // 还有额度却被拒 → 瞬时错误，短冷却继续用
+              markCooling(account.id, 2 * 60_000);
+              attempted.push({ account: label, ok: false, error: `额度接口瞬时拒绝（剩余 ${remaining}）` });
+            }
+            continue;
+          }
+          logger.warn('ZCODE-GW', '{label} 上游 200 业务错误:{err} ({snippet})', { label, err: formatUpstreamError(200, text), snippet: text.slice(0, 80) });
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+          res.end(text);
+          return true;
+        }
+        // 真 Message（非流式）——原样转发
+        logger.debug('ZCODE-GW', '{label} 补全成功 ({status})', { label, status: upstream.status });
+        stats.lastAccount = label;
+        recordRecentAccount(label);
+        cooling.delete(account.id);
+        resetCoolingStreak(account.id);
+        touchSticky(sessionId, account.id);   // 会话粘住这个号，后续轮不再跳
+        res.writeHead(upstream.status, { 'Content-Type': ct || 'application/json', 'Cache-Control': 'no-cache' });
+        res.end(text);
+        return true;
+      }
+      logger.debug('ZCODE-GW', '{label} 补全成功 ({status})', { label, status: upstream.status });
+      stats.lastAccount = label;
+      recordRecentAccount(label);
+      cooling.delete(account.id);
+      resetCoolingStreak(account.id);
+      touchSticky(sessionId, account.id);   // 会话粘住这个号，后续轮不再跳
+      // 注意：undici 已自动解压上游 gzip——body 是明文，绝不能再带 content-encoding 头
+      // （带着会让客户端对明文做 gunzip → 乱码）
+      const out = {
+        'Content-Type': upstream.headers.get('content-type') || 'application/json',
+        'Cache-Control': 'no-cache',
+      };
+      res.writeHead(upstream.status, out);
+      try {
+        const reader = upstream.body.getReader();
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (!res.write(Buffer.from(value))) {
+            await new Promise((r) => res.once('drain', r));
+          }
+        }
+      } catch (e) {
+        if (clientAbort.signal.aborted) {
+          // 客户端主动断开（点停止/换一句）就会在这里结束——属正常收尾，不是故障，降为 debug
+          logger.debug('ZCODE-GW', '流式转发中断:{err}', { err: e.message });
+        } else {
+          // 上游中途断了：直接 res.end() 是无 message_stop 的裸 EOF，客户端只会报
+          // 「流意外结束」——按 Anthropic 协议补一帧 error 事件，把原因带出去
+          logger.warn('ZCODE-GW', '上游流中断:{err}', { err: e.message });
+          try {
+            res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message: `上游流中断：${e.message}` } })}\n\n`);
+          } catch { /* 客户端已不在 */ }
+        }
+      }
+      res.end();
+      return true;
+    }
+
+    const text = await upstream.text().catch(() => '');
+    // 验证码类失败：作废 token 并强制重解（有提供者时下一次尝试带上新 token）
+    if (isCaptchaError(upstream.status, text)) {
+      invalidateCaptcha();
+      attempted.push({ account: label, ok: false, error: `验证码被拒（${upstream.status}）`, captcha: true });
+      logger.warn('ZCODE-GW', '{label} 验证码被拒 ({err})', { label, err: formatUpstreamError(upstream.status, text) });
+      try { captcha = await ensureCaptcha(true); } catch (e) {
+        logger.warn('ZCODE-GW', '验证码重解失败:{err}', { err: e.message });
+        captcha = null;
+      }
+      continue;
+    }
+    if (isAuthError(upstream.status, text)) {
+      markDead(account);
+      attempted.push({ account: label, ok: false, error: 'JWT 已失效，账号拉黑（重新登录后再导入）' });
+      logger.debug('ZCODE-GW', '{label} JWT 失效,拉黑', { label });
+      continue;
+    }
+    if (isExhausted(upstream.status, text)) {
+      markCooling(account.id, 30 * 60_000);
+      attempted.push({ account: label, ok: false, error: '额度不足/无资源包' });
+      logger.debug('ZCODE-GW', '{label} 额度不足 ({status})', { label, status: upstream.status });
+      continue;
+    }
+    if (upstream.status === 429) {
+      const ms = markRateLimited(account.id);
+      const dur = formatDurationMs(ms);
+      const streak = coolingStreak.get(account.id);
+      attempted.push({ account: label, ok: false, error: `429 限流，冷却 ${dur}` });
+      logger.debug('ZCODE-GW', '{label} 429 限流,冷却 {dur}(连续第 {streak} 次)', { label, dur, streak });
+      continue;
+    }
+    // 其他错误：友好化展示 + 原样透传给客户端
+    const errorSummary = formatUpstreamError(upstream.status, text);
+    logger.warn('ZCODE-GW', '{label} 上游错误 {status} — {summary}', { label, status: upstream.status, summary: errorSummary });
+    res.writeHead(upstream.status, { 'Content-Type': 'application/json' });
+    res.end(text);
+    return true;
+  }
+
+  const failedDetail = summarizeAttempts(attempted);
+  logger.warn('ZCODE-GW', '全部 {n} 次尝试失败{detail}(下一请求自动重试)', { n: attempted.length, detail: failedDetail ? ':' + failedDetail : '' });
+  res.writeHead(502, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'ZCode 网关：所有账号尝试均失败', attempts: attempted }));
+  return true;
+}
+
+// ── 面板状态 ──
+
+export async function gatewayStatus() {
+  const enabled = await gatewayEnabled();
+  const hasCaptcha = Boolean(getZcodeCaptchaProvider());
+  const all = (await loadAccounts()).filter((a) => a.provider === 'zcode');
+  let withJwt = 0;
+  for (const a of all) { try { claimToken(a); withJwt++; } catch { /* 无 plan JWT */ } }
+  const now = Date.now();
+  const settings = await loadSettings();
+  return {
+    enabled,
+    hasCaptcha,
+    lan: settings.zcodeGatewayLan === true,
+    allow: Array.isArray(settings.zcodeGatewayAllow) ? settings.zcodeGatewayAllow : [],
+    suggestAllow: gatewayHostSuggestion(),
+    stats: {
+      lastCallAt: stats.lastCallAt,
+      calls: stats.calls,
+      lastAccount: stats.lastAccount,
+      // 只回窗口内服役过的号（面板徽章口径）；recentWindowMs 让面板能对齐展示
+      recentAccounts: recentLabelsInWindow(recentEntries),
+      recentWindowMs: RECENT_WINDOW_MS,
+    },
+    exhausted: all
+      .filter((a) => isQuotaExhausted(a.id))
+      .map((a) => ({ id: a.id, name: a.name || a.uid || a.id, remaining: quotaCache.get(a.id)?.remaining ?? 0 })),
+    accounts: all.length,
+    accountsWithJwt: withJwt,
+    // 会话粘滞：当前有多少段会话各自钉在一个号上（面板「接口使用中」徽标据此说明）
+    stickySessions: sessionSticky.size,
+    // cooling 保持字符串数组（历史形状，测试与面板按名字读）；冷却细节走 coolingDetail
+    cooling: all.filter((a) => !isDead(a) && (cooling.get(a.id) || 0) > now).map((a) => a.name || a.uid || a.id),
+    coolingDetail: all.filter((a) => !isDead(a) && (cooling.get(a.id) || 0) > now)
+      .map((a) => {
+        const remainMs = (cooling.get(a.id) || 0) - now;
+        return {
+          id: a.id, name: a.name || a.uid || a.id,
+          // 秒数为准：退避阶梯第一档只有 30s，按分钟四舍五入会显示成 1 分钟
+          remainMs, remainSeconds: Math.max(0, Math.ceil(remainMs / 1000)),
+          remainText: formatDurationMs(remainMs),
+          streak: coolingStreak.get(a.id) || 0,
+        };
+      }),
+    dead: all.filter((a) => isDead(a)).map((a) => a.name || a.uid || a.id),
+    endpoint: '/gateway/zcode/v1/messages',
+    note: hasCaptcha ? null : '需要桌面版 CreditDaddy（隐藏窗口验证码），纯 CLI / NAS 环境不可用',
+  };
+}

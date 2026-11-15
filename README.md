@@ -1,85 +1,487 @@
-# checkin-hub 签到中心
+<div align="center">
 
-Trae（国内版）和 WorkBuddy 每日自动签到，带网页后台，docker 常驻，不用开电脑。纯 Python 标准库，无第三方依赖（二维码也是自带的生成器）。
+<img src="desktop/icon.png" width="96" alt="CreditDaddy">
 
-- WorkBuddy：每天 100 积分（连签有额外奖励）
-- Trae：每天约 150 积分
-- **网页后台**：总览（今日是否签到、积分/连签、近 14 天、最近记录）、立即签到、在网页里改令牌/时间/通知，不用再改文件重启
-- **网页扫码登录**：令牌失效时在网页点一下生成二维码，手机扫码即可，令牌自动写入（WorkBuddy）
-- **网页一键登录**：Trae 生成一个脚本，在电脑上双击就跑完登录并回传令牌（Trae 的回调只能落在本机 127.0.0.1，没法手机扫码）
-- 每天北京时间 00:23（Trae）/ 00:30（WorkBuddy）起签，失败自动重试，成功/失败/放弃时推送 ntfy（可选）
-- 轮换后的令牌自动保存在 `./data`，容器重启不丢
-- 镜像由 GitHub Actions 构建：`linux/amd64`、`linux/arm64`、`linux/arm/v7`
+# CreditDaddy（本仓库为 Docker 定制版）
 
-## 部署
+> **定制说明**：本仓库 fork 自 [techysy/CreditDaddy](https://github.com/techysy/CreditDaddy)，只做两件事：
+> 1. 加了 Docker 镜像构建（`Dockerfile` + `.github/workflows/docker.yml`，产出 `ghcr.io/lu8010252/checkin-hub`）；
+> 2. 加了 ntfy 签到推送（`src/notify.js`，钩在 `src/checkin.js` 的签到汇总处），配置环境变量 `CREDITDADDY_NTFY_URL` / `CREDITDADDY_NTFY_TOKEN` 即生效。
+>
+> 部署见下面的 [Docker 部署](#docker-部署)，上游同步见 [跟上游同步](#跟上游同步)。
+> 其余功能、文档、截图均来自上游，未做改动。
+
+**AI 编程工具多账号本地管理 + 每日积分自动领取（领鸡蛋）助手：Qoder · WorkBuddy · ZCode · mirasim · 妙手 · Trae · MiniMax · ModelScope · 豆包 Doubao · 讯飞 Loomy · Meoo 秒悟，集成 10Router 额度总览、用量同步与网页会话额度卡（Token Harbor / 小米 MiMo / River / ModelScope 魔搭 / LongCat）**
+
+[![Release](https://img.shields.io/github/v/release/techysy/CreditDaddy?label=%E7%89%88%E6%9C%AC&color=2563eb)](https://github.com/techysy/CreditDaddy/releases/latest)
+[![CI](https://img.shields.io/github/actions/workflow/status/techysy/CreditDaddy/ci.yml?branch=main&label=CI)](https://github.com/techysy/CreditDaddy/actions/workflows/ci.yml)
+[![Downloads](https://img.shields.io/github/downloads/techysy/CreditDaddy/total?label=%E4%B8%8B%E8%BD%BD&color=16a34a)](https://github.com/techysy/CreditDaddy/releases)
+[![npm](https://img.shields.io/npm/v/creditdaddy?label=npm&color=cb3837)](https://www.npmjs.com/package/creditdaddy)
+[![Platform](https://img.shields.io/badge/%E5%B9%B3%E5%8F%B0-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20fnOS-6b7280)](#下载)
+[![Platform](https://img.shields.io/badge/%E5%85%A8%E5%B9%B3%E5%8F%B0%20%E5%AE%89%E8%A3%85-npm%20i%20--g%20creditdaddy-cb3837?logo=npm&logoColor=white)](#下载)
+[![Node](https://img.shields.io/badge/Node.js-%E2%89%A5%2020-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
+[![License](https://img.shields.io/github/license/techysy/CreditDaddy?label=%E8%AE%B8%E5%8F%AF&color=f59e0b)](LICENSE)
+
+[下载](#下载) · [架构](#%EF%B8%8F-架构) · [功能](#功能) · [10Router 集成](#10router-集成) · [产品线说明](#产品线说明) · [快速开始](#快速开始) · [HTTP API](#本地-http-api) · [相关项目](#-相关项目) · [贡献者致谢](#-贡献者致谢) · [许可证](#-许可证)
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-dashboard-dark.png">
+  <img src="docs/screenshot-dashboard-light.png" width="860" alt="CreditDaddy 仪表盘">
+</picture>
+
+</div>
+
+> 项目原名 **QoderDaddy**，v0.3.0 起更名为 CreditDaddy：数据目录自动从 `~/.qoderdaddy` 迁移到 `~/.creditdaddy`（旧目录保留），旧的 `QODERDADDY_HOME` / `QODERDADDY_PASSWORD` 环境变量与 QoderDaddy 导出文件仍可使用。
+> 架构参考 [WorkDaddy](https://github.com/babygoton/WorkDaddy)（本地守护进程 + Web 面板 + 数据全留本机 + 仅监听 127.0.0.1），签到能力移植自 [10router](https://github.com/techysy/10router) 的 qoderCheckin / codebuddyCheckin，并按 Qoder App 0.2.x、WorkBuddy 桌面端的真实协议补全。
+
+## Docker 部署
+
+镜像由本仓库 Actions 构建：`ghcr.io/lu8010252/checkin-hub:latest`（linux/amd64、linux/arm64）。
 
 ```bash
-mkdir checkin-hub && cd checkin-hub
-# 把仓库里的 docker-compose.yml 放进来，改掉里面的 WEB_PASSWORD
+mkdir -p ~/creditdaddy && cd ~/creditdaddy
+# 放好 docker-compose.yml，改掉里面的 CREDITDADDY_PASSWORD
 docker compose up -d
 ```
 
-浏览器打开 `http://服务器IP:8090`，用 `WEB_PASSWORD` 登录，到「设置」里填令牌即可。
+打开 `http://服务器IP:47861`，用 `CREDITDADDY_PASSWORD` 登录。
 
-> 没设置 `WEB_PASSWORD` 时会生成随机密码，写在日志（`docker compose logs`）和 `data/.web_password` 里。
-> **别把后台直接暴露公网**：用反向代理加 HTTPS（并设 `TRUST_PROXY=1`），或只在内网访问。
+必要环境变量：
 
-想自己构建：取消 `docker-compose.yml` 里 `build: .` 的注释，用 `docker compose up -d --build`。
+| 变量 | 说明 |
+| --- | --- |
+| `CREDITDADDY_HOME` | 数据目录，镜像里固定 `/data`（挂卷） |
+| `CREDITDADDY_PASSWORD` | 面板访问密码 |
+| `CREDITDADDY_NTFY_URL` | 可选。签到有结果时推送到该 ntfy topic |
+| `CREDITDADDY_NTFY_TOKEN` | 可选。自建 ntfy 需要鉴权时填 |
 
-试跑一次看结果（不影响常驻服务）：
+推送格式：纯文本 `标题\n正文`，与常见 ntfy 客户端一致；只在「本轮有领取成功或失败」时推，全为「今日已领」时不打扰。
 
-```bash
-docker compose exec checkin python app.py once
-```
-
-## 登录 / 获取令牌
-
-令牌在网页「设置」里改，改完今天还没签成的会立即重试。下面两种是推荐做法，末尾保留手动导出的备用方案。
-
-### WorkBuddy：网页扫码
-
-后台导航「扫码登录」→ 点「生成二维码」→ 手机扫码登录。二维码里的 `state` 是一次性的（30 分钟有效），后台会轮询到令牌自动写入，并立刻重签一次。
-
-手动填的话：电脑上登录着 WorkBuddy 客户端，打开登录态文件，找到 `auth.refreshToken`（约 700 字符，整串复制，别漏）：
-
-- Windows：`%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info`（找不到再看 `%APPDATA%` 同路径）
-- macOS：`~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info`
-
-### Trae：网页一键登录
-
-后台导航「Trae 登录」→ 生成登录脚本 → 下载后在自己电脑上双击（需要 Python 3）。**设置里没填设备号时，后台会自动给盒子生成一个自己的设备身份（设备号 + 密钥），不用再从电脑导出，也不影响电脑上的 Trae**；已经填过设备号的保持不变，想重置就把设备号清空再登录一次。
-
-1. 脚本在本机 `127.0.0.1:8931` 起回调服务（Trae 授权页只认这个地址，改成局域网地址会直接报「网络错误」）
-2. 自动打开 Trae 登录页，完成登录
-3. 脚本把授权码转给后台，后台用自己的设备身份换令牌、写进配置，然后立即重签
-
-脚本 30 分钟内有效，过期回网页重新生成即可。
-
-手动导出 5 项（`TRAE_REFRESH_TOKEN` / `TRAE_DEVICE_ID` / `TRAE_MACHINE_ID` / `TRAE_DEVICE_KEY_PEM` / `TRAE_DEVICE_PUB_PEM`）：Trae 续期需要「设备证明」，所以要从登录着 Trae 的那台电脑导出，用 [L0NE-6/Trae-AutoCheckin](https://github.com/L0NE-6/Trae-AutoCheckin) 里的 `trae_get_token.py`：
+## 跟上游同步
 
 ```bash
-python trae_get_token.py                 # 打印 TRAE_REFRESH_TOKEN
-python trae_get_token.py --export-keys   # 打印 TRAE_DEVICE_KEY_PEM / TRAE_DEVICE_PUB_PEM / TRAE_DEVICE_ID / TRAE_MACHINE_ID
+git remote add upstream https://github.com/techysy/CreditDaddy.git
+git fetch upstream
+git switch main
+git merge upstream/main     # 冲突通常只出现在 src/checkin.js 的 import 与汇总钩子处
+git push origin main        # 推送后 Actions 自动重建镜像
 ```
 
-PEM 可以直接粘贴多行，也可以是一行里用 `\n` 代替换行。输出里有令牌和设备私钥，别发给别人、别贴到公开的地方。
+本仓库的自有改动只有三处，冲突时保留即可：`Dockerfile`、`docker-compose.yml`、`src/notify.js` 与 `src/checkin.js` 里的一行钩子（`notifyCheckinResult(...)`）。
 
-## 注意
+## 下载
 
-1. **Trae 的令牌只能在一处续期。** 服务器续期后，电脑上的 Trae 客户端登录态可能失效，需要重新登录；重新登录后回网页点一次「Trae 登录」跑脚本即可。改了令牌后，今天没签成的会立即重试。
-2. 一个设备号一天只能签一个 Trae 账号，所以这里只支持单账号。
-3. 一直提示 9074：多半是设备号不对（必须是客户端真实注册的那串数字），重新导出。
-4. 这些是非官方接口，官方改接口或风控后可能失效；失效时会推送通知，网页和日志里有原因。账号风险自负，建议别用主力号。
-5. 令牌只写不读：网页永远不显示完整令牌，只显示前后几位。`data/` 里是账号凭证，不要提交到公开仓库（已在 `.gitignore`）。
+从 [**Releases**](https://github.com/techysy/CreditDaddy/releases/latest) 下载对应平台的安装包：
 
-## 环境变量（都可选，网页里保存的设置优先）
-
-| 变量 | 说明 | 默认 |
+| 平台 | 文件 | 说明 |
 | --- | --- | --- |
-| `WEB_PASSWORD` | 网页后台登录密码 | 随机生成 |
-| `WEB_PORT` | 容器内网页端口 | 8080 |
-| `TRUST_PROXY` | 前面有反向代理时设 `1`（读取真实 IP、HTTPS cookie） | 空 |
-| `CHECKIN_PROXY` | 访问 Trae/WorkBuddy 接口走的代理（仅环境变量可设） | 空（直连） |
-| `TRAE_IDE_VERSION` | 模拟的 Trae 版本 | 1.107.1 |
+| 全平台（安装包） | `npm i -g creditdaddy` | **任意平台**（Windows / macOS / Linux，x64 与 arm64 皆可），一行命令装成 `creditdaddy` 命令；也支持 `npx creditdaddy` 免安装试跑，详见[方式三](#方式三nodejs-cli--守护进程) |
+| Windows | `CreditDaddy-Win-Setup-<版本>.exe` | 安装版（推荐） |
+| Windows | `CreditDaddy-Win-Portable-<版本>.exe` | 便携版，免安装，双击运行 |
+| macOS（Apple Silicon） | `CreditDaddy-Mac-Setup-<版本>-arm64.dmg` | M1 及以后的芯片 |
+| macOS（Intel） | `CreditDaddy-Mac-Setup-<版本>-x64.dmg` | Intel 芯片 |
+| 飞牛 fnOS | `CreditDaddy-FnOS-Window-<版本>-x86.fpk` | **推荐**：桌面窗口入口（x86） |
+| 飞牛 fnOS | `CreditDaddy-FnOS-Window-<版本>-arm.fpk` | 桌面窗口入口（ARM） |
+| 飞牛 fnOS | `CreditDaddy-FnOS-<版本>-x86.fpk` | 独立全屏 / 兼容入口（x86） |
+| 飞牛 fnOS | `CreditDaddy-FnOS-<版本>-arm.fpk` | 独立全屏 / 兼容入口（ARM） |
 
-其余（令牌、时间、重试、ntfy）都在网页「设置」里改。
+> macOS 安装包未做代码签名：首次打开请在「应用程序」里**右键 → 打开**，或在终端执行 `xattr -cr /Applications/CreditDaddy.app`。
+> 飞牛 fnOS 部署自动启用密码保护，首次安装在向导中设置密码，「应用设置」中可重置。
+
+---
+
+## 🏗️ 架构
+
+<div align="center">
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/architecture.svg">
+  <img src="docs/architecture-light.svg" width="860" alt="CreditDaddy 架构">
+</picture>
+
+</div>
+
+---
+
+## 功能
+
+**多账号管理与切换**
+- **仪表盘 + 分产品标签页**：首页仪表盘汇总账号总数、今日领取进度、剩余总积分、下次自动执行时间、各产品概况、待处理异常账号（token 失效 / 即将过期、领取失败）与最近领取审计；Qoder、WorkBuddy、ZCode、mirasim、妙手、Trae、MiniMax 各自独立标签页，卡片式展示，支持国内 / 国际版筛选，直观查看连续天数与额度包到期，自适应亮色 / 暗色主题。右上角「组件开关」可整块收起不使用的产品 / 10Router 标签页与仪表盘卡片（偏好保存在浏览器本地）。
+- **本机导入**：一键安全读取本机已登录的客户端凭据 —— 本地解密 Qoder / Qoder CN 的 `auth.v1.dat`，读取 WorkBuddy 客户端（当前与历史会话），解密 ZCode / mirasim / 妙手 / Trae 客户端凭据，读取 MiniMax Code 的 `~/.minimax` 登录记录。敏感 Token 绝不出机器；同一用户续期时自动覆盖。
+- **客户端一键换号**：一键将桌面客户端切换至指定账号（WorkBuddy 自动热切换；ZCode / mirasim / 妙手 / Trae 退出客户端后写回并自动重新拉起），切号前自动保存当前在线 Token，各账号拥有独立设备指纹，杜绝风控串号。
+- **内置隐私（无痕）授权**：桌面版提供隔离的一次性会话窗口进行网页登录授权，不污染系统浏览器 Cookie，支持同平台无缝扩增多账号。
+- **全流程浏览器登录**：支持五家产品线在面板内直接完成网页 / 设备码授权并入库 —— Qoder 设备码授权（PKCE + nonce）、WorkBuddy 状态轮询、ZCode CLI 轮询（支持智谱 BigModel 与 Z.ai）、MiniMax 官方 OAuth 设备码授权（S256 PKCE）、Trae 官方同款授权码 + PKCE（国内 / 国际双线）。
+  > ⚠️ **Trae 浏览器登录需「同机」完成**：Trae 采用官方客户端同款机制，授权完成后浏览器会回跳 `http://127.0.0.1:<端口>` 的本机回调（由 CreditDaddy 监听）。因此请在**运行 CreditDaddy 的同一台机器**上打开授权链接完成登录——回跳打在本机回环才算送达。**远程场景（如 fnOS / NAS 网页面板在另一台电脑的浏览器里打开）回跳会落在你眼前的电脑上，浏览器报「无法访问 / 拒绝连接」属预期现象**，此时登录不会完成；NAS 上请改用「本机导入」（Trae 客户端装在同一台 NAS 时）或桌面版 / 同机浏览器操作。其余四家产品线为设备码 / 服务端回调，不受此限制，可跨机远程操作。
+- **网页会话免费额度捕获**：配置驱动的通用浏览器 cookie 捕获框架，接入 Token Harbor / 小米 MiMo / River AI / ModelScope 魔搭 / LongCat（美团）五家「凭据只在网页会话」的供应商——桌面版隐私窗登录自动收割（含 localStorage 凭据变体与鉴权 cookie 轮询等待），支持同站点多号并存、按身份归户、粘贴捕获兜底、就地重探（免重登刷新身份与余额）与三色探活呼吸灯 + 死会话低频重试；凭据只存本机，面板「免费额度」页统一管理。
+
+**自动领取与资产保障**
+- **每日智能轮询**：本地守护进程每 ~2 小时自动扫描执行；当日已领成功的账号自动记忆跳过，未开启活动的账号不落记忆，以每日 10:00 (UTC+8) 刷新周期为准自动重试。
+- **Qoder 国际版风控支持**：真实携带客户端生成的设备风控凭据，还原官方客户端「每日 100 Credits」领取链路。
+- **ZCode 活动智能轮询**：支持免验证码活动直领，遇到图形验证码时桌面版自动拉起静默验证（高风险弹出人工窗口处理），NAS / CLI 环境自动标记提示。
+- **凭据导出导入**：支持口令加密备份，格式与 10Router OAuth 迁移标准（`10router-oauth-secure-v1`）无缝互通，实现多端授权轻松迁移。
+- **安全边界**：守护进程仅监听 `127.0.0.1` 本机回环，严格校验 Host 头防止 DNS 重绑定，拦截跨站 Origin 杜绝 CSRF；存储位于 `~/.creditdaddy`（0600 权限 + 原子写 + 串行锁），无遥测、无第三方依赖。
+- **多账号隔离与防关联**：每账号独立凭据快照与设备身份（Trae deviceId 按 uid 确定性派生、ZCode 各账号独立凭据文件、网页会话线按身份归户），账号之间互不共享会话。⚠️ 但**同一平台的多个账号共享同一出口 IP 时上游可以关联**——设备归属被标记后同机器的兄弟号可能被连带。建议在 10Router 侧用 **Proxy Pools**（连接级代理池）给不同账号配不同出口 IP，并控制单号并发；跨平台指纹共享无影响（各平台账号体系独立）。
+
+## 10Router 集成
+
+在面板「10Router」标签页配置 10Router 服务地址与仪表盘创建的 **虚拟 key**（sk-…）。Key 仅存储于本地 `tenrouter.json`（0600 权限），面板只显示脱敏值。
+
+- **供应商额度卡片（10Router 1.2.1+）**：通过 `GET /api/usage/quotas` 一键读取 10Router 中其他供应商（CodeBuddy / Qoder / Claude / GLM 等）的额度卡片。CodeBuddy / Qoder / GLM 会自动标明**国内版 / 国际版**，当额度不足 10% 时自动标红并推送到仪表盘「需要处理」。支持 5 分钟连接级缓存与手动强制刷新。
+- **账号同步（一键推送为 10Router 连接）**：把本机 Qoder / WorkBuddy 账号直接推为 10Router 上游连接。配置 10Router 面板密码后走 **OAuth 通道**（accessToken + refreshToken，10R 端按身份去重并原位更新、自动续期，反复同步幂等）；仅配虚拟 key 时走 **apikey 通道**（同名连接不覆盖，token 过期后需重新同步）。zcode → GLM 映射待反代就绪后补充（映射表已留接口）。
+- **用量自动同步（10Router 1.0.7+）**：内置与 10router-sync 插件一致的同步逻辑，支持一键或每小时自动同步本机 ZCode（`db.sqlite` 官方渠道）、OpenCode（`opencode.db`）、mirasim（`usage-*.ndjson`）、小米 MiMo（`mimocode.db`）的真实用量，以及**妙手（CatPaw）云端用量**（`v1/usage/token/daily` 按天 token 总量；当天桶隔天入账，云端无输入/输出拆分、整包计入输入，模型列默认 `unknown`，可在 `tenrouter.json` 的 `sync.catpawModel` 标注）至 10Router 统计。支持断点续传与 2 天重叠补偿。10Router 按**行内容签名**（时间戳 / provider / model / token 数等）去重，行内容还在变（会话进行中、按天桶增长）会被当成新行——因此客户端发出去的行保证已定型：1 小时结算窗内暂不发送、妙手按天桶只发差量、缺时间戳的行直接跳过；日志显示「新增 N 行，跳过 M 行重复」让去重结果可见。
+- *注：读取 SQLite 依赖 Node 22.5+ 内置的 `node:sqlite`（桌面版与 fnOS nodejs_v24 环境原生支持）。*
+- **外部配额卡推送（10Router 联动）**：把网页会话站点的免费额度以「外部配额卡」推入 10Router 配额追踪器——Token Harbor / 小米 MiMo / River / ModelScope / LongCat / MiniMax 免费线各自成 source，余额数字与逐包明细腿直接出卡（储值口径 / 今日-长期拆分 / 赠送包徽注），会话失效自动降级状态卡；载荷经出口强校验**只带标量数字，凭据永不出本机**。卡面带签名回调 `refreshUrl`，10Router 侧点「刷新配额」即回源 CreditDaddy 现拉最新余额重推（8 天过期 + HMAC 签名 + 限流）；同名认领可把额度卡挂到连接卡上，改账号别名即时生效。
+
+## 产品线说明
+
+### WorkBuddy（腾讯 CodeBuddy 系）
+- **账号来源**：共享 CodeBuddy CLI / 插件凭据目录 `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\`（macOS `~/Library/Application Support/CodeBuddyExtension/…`，Linux `~/.local/share/CodeBuddyExtension/…`）。按 Keycloak JWT 签发域名自动区分：`*.codebuddy.cn` / `*.workbuddy.cn` / `copilot.tencent.com` 识别为国内版，`*.codebuddy.ai` / `*.workbuddy.ai` 识别为国际版。
+- **签到与积分**：国内版调用 `/v2/billing/meter/daily-checkin` 领取积分并累计签到天数；调用 `/v2/billing/meter/get-user-resource` 查询循环额度与活动赠送包剩余量。
+- **国际版保持活跃**：国际版官方无签到接口，规则为「每日有效对话即可获取赠送积分」。调度器每日自动为国际版账号发起一次极简免费档模型流式会话（rateMultiplier 0，几乎零消耗），达成活跃条件。
+- **Token 续期与切号**：过期时自动通过 refreshToken 换发新 Token。若为客户端当前登录账号，会同步写回文件避免客户端掉线；切号时安全写入 `workbuddy-desktop.info` 并触发客户端热切换。
+
+### ZCode（智谱 GLM / Z.ai）
+- **账号来源**：读取 `~/.zcode/v2/credentials.json`，本地通过派生密钥解密 `enc:v1:` AES-256-GCM 凭据，Token 绝不出机。
+- **活动领取**：支持自动轮询可领活动（`billing/preview` → `billing/claim`）。支持免验证码直接领取，需验证码时桌面端通过隐藏窗口调度验证码 SDK。
+- **网络出口与客户端跟随**：接口校验客户端版本（注册表动态读取）。网络层支持配置专属代理（`zcode-net.json` 或 `HTTPS_PROXY`），支持「直连优先 / 代理优先」无缝切换。
+- **账号切换**：写回凭据并自动为各账号分配独立的 `deviceMid` 设备指纹，防止多账号设备关联风控。
+
+### Qoder（国际版 / 国内版）
+- **国际版领取与设备风控**：Qoder 国际版服务端严格校验设备风控身份（`Cosy-MachineToken / Cosy-MachineCode / Cosy-MachineType`）。
+- **设备组件依赖**：风控凭据由本机已安装的 Qoder 客户端组件生成（每 50 分钟刷新）。每台设备每日限领一个国际版账号，列表靠前账号优先领取。
+- **Linux / fnOS 设备组件安装**：无客户端环境下，面板提供一键安装「设备身份组件」（或执行 `creditdaddy umid install`），自动从官方 `@qoder-ai/qodercli` 中提取 Linux x64 / arm64 UMID 核心组件。国内版不受风控限制，全部账号可正常签到。
+  > npm 全局安装的 Linux 用户同样适用：`sudo npm i -g creditdaddy && creditdaddy umid install`（组件落在数据目录 `qoder-umid/`，首次运行自动创建）。
+
+### mirasim（原生 AI 编程开发环境）
+- **账号来源**：读取 `~/.mirasim/setting.json`，本地通过 `secret.key` 派生密钥解密 `mrs1:` AES-256-GCM 凭据，敏感 Token 绝不出机。
+- **额度与套餐**：通过 `auth.mirasim.ai/auth/me` 查询当前套餐（Pro/Plus）及到期时间；通过 `relay.mirasim.ai/v1/limits` 查询「平台额度」（5小时滚动窗口、7天全局上限与分模型 Claude 上限）。支持直连与代理优先切换，防止网络区域限制。
+- **客户端切号**：一键切换当前登录账号并写回 `setting.json`（保留工作区与模型配置不变），切号前自动同步当前在线 Token；桌面版切换成功后自动重新拉起 Mirasim 客户端。
+
+### 妙手（美团 CatPaw）
+- **账号来源**：读取 `%APPDATA%\catpaw-moon\catx-credential.json`，其 `ssoTokenEnc` 为 AES-256-GCM 密文（`iv‖tag‖ciphertext`），密钥由本机 `MachineGuid` 派生（`sha256(machineId + ":catpaw-desk-token-v2")`），敏感 Token 绝不出机。
+- **额度与版本**：走桌面网关 `https://catx.nocode.cn/api/gateway/*`（纯 token 鉴权，`X-Auth-Token` 头）——`auth/current-user` 用户信息、`credit/balance` 可用 Credits 与当前套餐版本（体验版 / 专业版，含到期与下次刷新时间）。网页端 `credit.catpaw.meituan.com` 接口只认浏览器 Cookie，daemon 不使用。
+- **无签到、无对外续期**：按套餐发放 Credits，无每日签到活动；凭据由妙手客户端登录轮转，失效（401）时在客户端重新登录后再本机导入即可。
+- **客户端切号**：妙手启动时读凭据恢复登录（无热加载），切换 = 重写加密凭据 + 重启客户端；客户端运行中默认拒绝切换，强制切换自动退出并重新拉起妙手。
+- **仅 Windows**：妙手桌面客户端本身只有 Windows 版（凭据密钥派生自注册表 `MachineGuid`、进程名为 `妙手.exe`），因此本机导入 / 切号在 Linux / NAS 上不可用——该产品线在非 Windows 平台自动隐藏对应入口，其余 6 条产品线不受影响。
+
+### Trae（字节 TRAE SOLO / Trae CN）
+- **账号来源**：解本机客户端 `<userData>/User/globalStorage/storage.json` 的 `iCubeAuthInfo://icube.cloudide`（Trae 自研「tc」信封：pepper 为随安装包分发的公开常量表，SHA512 两轮派生 + AES-128-CBC + SHA512 完整性前缀），纯 `node:crypto` 实现，不引入依赖、不需要 SQLite。敏感 Token 绝不出机。
+- **浏览器登录**（国内 / 国际双线）：官方客户端同款 OAuth 授权码 + PKCE，无需本机装 Trae 客户端；每账号独立设备指纹，不与已装客户端抢身份。授权完成时浏览器回跳本机回调端口——**须在运行 CreditDaddy 的同一台机器上完成授权**，跨机远程（NAS 网页面板）回跳报「无法访问」属预期，详见功能总览处的说明。
+- **签到与积分**：每日签到领积分，查询当前额度；面板显示凭据到期日，临期变红。
+- **有意不做自动续期**：Trae 的 refresh 会轮转 refreshToken 并作废 IDE 自己那份，等于把用户正在用的客户端踢下线，因此不提供自动续期。
+- **客户端切号**：按账号存 15 项登录态快照到 `~/.creditdaddy/trae-slots/<uid>/`，换走前先自动快照当前登录避免丢号；客户端在跑时拒绝切换（Trae 会把内存里的旧登录写回文件），强制切换后自动重新拉起。`x-device-id` 必须为纯数字设备号（传 GUID 触发 `code 9074`），优先取 `storage.json` 里 `iCubeAuthInfo://icube-dc:<数字>` 的键名后缀以与 IDE 自身指纹一致，缺失时按 uid 确定性派生。
+
+### MiniMax（MiniMax Code）
+- **账号来源**：两种方式——① 本机导入，读取 MiniMax Code 客户端的 `~/.minimax/auth/prod/cn/mcode-public/auth.json` 当前登录记录（明文文件，token 不出机）；② **浏览器登录**，走官方 OAuth 设备码授权（RFC 8628 + S256 PKCE），桌面版在内置隐私窗口打开 `account.minimax.cn/oauth-authorize` 完成授权，无需本机客户端。
+- **额度与签到**：查询积分余额（按「免费/活动」与「购买」拆分，带套餐名与到期）；每日签到领积分并累计连续天数。
+- **刷新轮换互斥的处理**：MiniMax 的 refreshToken 是一次性轮换的，本机客户端会独立刷新。为避免 CreditDaddy 用陈旧快照刷新触发 `invalid_grant`：本机导入账号在刷新前会从 `auth.json` 重读最新 refreshToken 对齐，刷新成功后再安全回写文件（仅客户端未运行时，运行中回写会作废客户端内存里的 token 故跳过）。浏览器登录拿到的是独立 `loginEpoch` 凭据链，不与本机客户端共用，从根上消除互斥。
+- **本地网关**：内置 Anthropic 兼容端点 `POST /gateway/minimax/v1/messages`，10Router 建 anthropic-compatible 节点指向即可把 MiniMax 当普通供应商调度；多账号轮换、401 自动刷新重试、429 冷却、SSE / JSON 流式透传、局域网 IP 白名单（与 ZCode 体验包接口同机制）。
+
+### 网页会话免费额度站点（配置驱动捕获框架）
+五家「凭据只存在于浏览器会话」的供应商共用一套配置驱动的网页会话捕获框架（`src/cookieSites.js` 站点表 + `src/externalQuota.js` 推卡 + 各站点 client）：面板「免费额度」页登录窗捕获，凭据只存本机账号库，余额数字推 10Router 外部配额出卡。共同纪律：**余额接口即探测**（会话有效返 200 JSON、失效返 401）、就地重探免重登、死会话低频重试、载荷零凭据。
+
+| 站点 | 凭据形态 | 额度口径 |
+| --- | --- | --- |
+| Token Harbor（issue #23） | 登录页 HTML 探针读数 | 免费 allowance 百分比 + 重置倒计时 |
+| 小米 MiMo（issue #24/26） | 控制台会话 cookie（父域收割） | 充值可用余额（CNY 储值卡）+ UID 归户 |
+| River AI | WorkOS localStorage JWT 变体（三源收割） | `$25` 免费额度 `balance_usd`，会话过期自动续期 |
+| ModelScope 魔搭（issue #25） | 会话 cookie（双源） | 魔粒余额，卡面拆「今日发放 / 长期」两腿；每日额度登录自动发放、无签到端点 |
+| LongCat 美团（issue #29） | 美团 SSO 会话 cookie | Token 资源包：Balance 汇总 + 逐包明细腿（官方消耗顺序、赠送包徽注、到期日） |
+| Meoo 秒悟 | meoo.com 会话 cookie（阿里云 SSO 手机号 + 短信登录） | 每日首登积分（`/api/mc/entitlement/init` 触发，当前 +2000/天、约 6~7 天过期）自动领取 + 积分余额；会话失效（`NEED_LOGIN`）提示重新捕获；首版不推 10Router 卡 |
+
+> 注：办公小浣熊曾按 issue #27 调研接入，因 `raccoon_token` 异步写回时序不可靠已于 v1.5.0 回滚移除。
+
+## 快速开始
+
+### 方式一：桌面安装版 / 便携版（推荐）
+
+从 [Releases](https://github.com/techysy/CreditDaddy/releases/latest) 下载 Windows 或 macOS 版本：
+- 桌面托盘常驻，关闭窗口后台持续运行。
+- 托盘图标右键支持一键立即签到、查看各平台账号状态并弹窗通知结果。
+- 开机自启后完全免干预在后台执行。
+
+### 方式二：飞牛 fnOS 应用包（fpk）
+
+1. 下载对应架构的 fpk 文件（推荐 `CreditDaddy-FnOS-Window-<版本>-<架构>.fpk`）。
+2. 在 fnOS 应用中心选择「手动安装」，安装过程中设置访问密码。
+3. 安装完成后通过桌面的窗口图标即可进入管理面板。
+
+### 方式三：Node.js CLI / 守护进程 —— 全平台通用（含 Linux / NAS / 服务器）
+
+> **Linux 用户看这里**：这是本项目**全平台通吃**的安装方式，x64 / arm64 都能装，发行包只区分 CPU 架构、**不区分发行版**。
+> Linux 上暂时没有像 Windows / macOS 那样的图形安装包，但用这条命令装出来的就是**同一套完整程序**：
+> 本地守护进程 + 完整 Web 管理面板（浏览器里用，和桌面版界面一模一样）+ 全部产品线能力。
+> 桌面端只是额外套了一层 Electron 托盘壳，核心功能没有少。
+
+要求 **Node.js ≥ 20**（纯标准库实现，零外部 npm 运行时依赖）：
+
+```bash
+# 全局安装（任意平台：Windows / macOS / Linux，x64 / arm64）
+npm i -g creditdaddy
+# 或者免安装直接跑一次
+npx creditdaddy start
+
+# 后台启动（关掉终端也继续跑，默认 http://127.0.0.1:47860）
+creditdaddy start
+
+# 或者前台跑（Ctrl+C 停止，调试用）
+creditdaddy daemon
+```
+
+装完在浏览器打开 `http://127.0.0.1:47860` 就是管理面板。
+
+**Linux 怎么装 Node.js**：Node 官方为 `linux-x64` / `linux-arm64` 都提供预编译压缩包（[nodejs.org/download](https://nodejs.org/en/download)，**不需要编译、不挑发行版**），Debian / Ubuntu 也可用 [NodeSource](https://github.com/nodesource/distributions) 或发行版自带仓库；NAS / 容器里可用 `nodejs_v24` 这类社区应用包（fnOS 的 fpk 就是内置这一套）。已经能跑 `node -v` 就可以直接跳到 `npm i -g`。
+
+> **关于 npm 的“平台”**：npm 包本身只是 JS 代码，是全平台通用的——`npm i -g creditdaddy` 在任何装了 Node ≥ 20 的系统上装的都是同一份包。所谓“平台差异”只在**可选的原生组件**上：本项目核心零依赖，只有两个平台相关能力（见下方表格），缺失时对应功能自动降级、不影响其余 6 条产品线。
+
+**Linux 上各功能可用性**：
+
+| 能力 | Linux / NAS | 说明 |
+| --- | --- | --- |
+| 登录授权 / 签到 / 额度 / 面板 / 导出导入 / 10Router | ✅ 全可用 | 不依赖任何本机客户端，纯标准库 |
+| Qoder **国际版**签到 | ✅ 可用（装 UMID 组件） | 执行 `creditdaddy umid install`，自动从官方 `@qoder-ai/qodercli` 提取 **Linux x64 / arm64** 设备身份组件；不装则国际版无法领取（国内版不受限） |
+| Qoder **国内版**签到 | ✅ 全可用 | 不走设备风控 |
+| **本机导入**（读本机客户端登录） | ✅ 各产品线都有 Linux 路径 | Qoder `~/.config/Qoder`、WorkBuddy `~/.local/share/CodeBuddyExtension/…`、ZCode `~/.zcode`、mirasim `~/.mirasim`、MiniMax `~/.minimax`；Trae 读其用户数据目录 |
+| **客户端一键切号** | ⚠️ 仅 Windows 完整 | 「结束客户端进程 → 写回凭据 → 重新拉起」这套是 Windows 实现（`taskkill`）；Linux 适合用面板的**浏览器登录**加账号，或手动切号。不影响签到本身 |
+| **妙手（CatPaw）本机导入 / 切号** | ❌ 仅 Windows | 妙手客户端只有 Windows 版：凭据解密密钥派生自注册表 `MachineGuid`，客户端进程名也是 `妙手.exe` |
+| **用量同步**（ZCode / OpenCode / mirasim / MiMo 的 SQLite） | ✅ 可用，需 Node 22.5+ | 用内置 `node:sqlite` 读本地库；mirasim 走 ndjson 文件无需 SQLite |
+| 开机自启 / 图形托盘 | ⚠️ 自建 | CLI 只做后台守护；Linux 可用 systemd user service 挂 `creditdaddy start` 实现开机自启 |
+
+**Linux 后台常驻（systemd user service，可选）**：
+
+```bash
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/creditdaddy.service <<'EOF'
+[Unit]
+Description=CreditDaddy daemon
+After=network-online.target
+
+[Service]
+ExecStart=%h/.npm-global/bin/creditdaddy daemon
+# 上面的路径换成 `command -v creditdaddy` 的输出；nvm 用户可写 node 直启：
+#   ExecStart=/usr/bin/node %h/.npm-global/lib/node_modules/creditdaddy/bin/creditdaddy.js daemon
+Restart=always
+
+[Install]
+WantedBy=default.target
+EOF
+systemctl --user daemon-reload && systemctl --user enable --now creditdaddy
+systemctl --user status creditdaddy      # 用完 Ctrl+C 退出，不会停服务
+```
+
+**后台运行**（CLI 用户用这个，不需要一直开着终端）：
+
+```bash
+creditdaddy start      # 后台启动；已在运行则直接报出地址，不会起第二个
+creditdaddy status     # 查看运行状态（未运行时退出码 1，便于脚本判断）
+creditdaddy stop       # 停止（没在跑也算成功）
+creditdaddy restart    # 重启
+```
+
+`start` 会把实例拉到独立进程组，终端窗口关掉、SSH 断开都不影响每日自动签到。运行信息记在
+`<数据目录>/daemon.json`，日志在 `<数据目录>/logs/background.log`（按日归档的运行日志另在
+`daemon-<日期>.log`）。`start` / `stop` 都是幂等的，脚本里可以放心串着写。
+
+> 想要**托盘图标**和**开机自启**请用方式一的桌面版（Windows / macOS）；CLI 这条路只做后台守护，不装任何原生依赖，
+> Linux / NAS 上它就是主力形态（开机自启用上面的 systemd user service，或 Windows 的任务计划程序）。
+
+**CLI 常用命令**：
+
+```bash
+creditdaddy scan                    # 扫描导入本机 Qoder / WorkBuddy / ZCode / mirasim / 妙手 / Trae / MiniMax 客户端登录的账号
+creditdaddy add <token>             # 添加 Qoder 国际版账号
+creditdaddy add <token> --cn        # 添加 Qoder 国内版账号
+creditdaddy add <token> --workbuddy # 添加 WorkBuddy 国内版账号（--intl 为国际版）
+creditdaddy add <token> --name 备注 # 添加带别名的账号
+creditdaddy list                    # 列出当前所有账号状态与积分
+creditdaddy checkin                 # 立即触发全部账号自动领取
+creditdaddy checkin --cn            # 仅签到 Qoder 国内版（--intl 仅国际版）
+creditdaddy checkin --workbuddy     # 仅签到 WorkBuddy
+creditdaddy remove <id前缀>         # 删除指定账号
+creditdaddy export backup.json --password 密码   # 安全加密导出账号
+creditdaddy import backup.json [--password 密码] # 导入备份数据（兼容 10Router）
+creditdaddy umid install            # Linux / fnOS 安装 Qoder 国际版设备身份组件
+creditdaddy help                    # 查看完整命令行帮助
+```
+
+## 本地 HTTP API
+
+守护进程提供丰富的控制端点。若设置了 `CREDITDADDY_PASSWORD` 环境变量（fnOS 默认设置），所有请求须携带 `x-qd-key: <密码>` 头：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/api/accounts` | 获取所有已托管账号的脱敏列表 |
+| `POST` | `/api/accounts` | 添加新账号 `{name, provider, token}` |
+| `PATCH` | `/api/accounts/:id` | 修改账号备注名称 `{name}` |
+| `DELETE` | `/api/accounts/:id` | 删除指定账号 |
+| `POST` | `/api/accounts/:id/checkin` | 单独触发指定账号的领取 |
+| `GET` | `/api/accounts/:id/quota` | 查询指定账号的积分与额度明细 |
+| `POST` | `/api/accounts/:id/switch` | 一键将客户端登录会话切换至该账号 |
+| `GET` | `/api/accounts/:id/zcode/plans` | 查询 ZCode 账号的可用活动列表 |
+| `POST` | `/api/accounts/:id/zcode/claim` | 领取指定的 ZCode 活动 `{planId, captchaParam?, region?}` |
+| `GET` | `/api/zcode/captcha-config` | 获取 ZCode 图形验证码配置参数 |
+| `POST` | `/api/checkin` | 触发全局领取 `{provider?, product?, skipIfCheckedToday?}` |
+| `POST` | `/api/auth/device/start` | 发起浏览器登录授权会话 |
+| `POST` | `/api/auth/device/poll` | 轮询浏览器登录状态与 Token `{sessionId}` |
+| `GET` | `/api/local/detect` | 检测本机客户端与配置目录环境 |
+| `POST` | `/api/local/scan` | 读取本机已登录的全部账号候选 |
+| `POST` | `/api/local/import` | 批量将检测到的候选账号导入入库 |
+| `GET` | `/api/status` | 获取服务运行状态、版本号及风控组件状态 |
+| `GET` / `PUT` | `/api/zcode/net` | ZCode 出口偏好（直连 / 代理优先、代理地址、活动自动领取开关） |
+| `GET` / `PUT` / `DELETE` | `/api/tenrouter` | 查询 / 配置 / 清除 10Router 集成参数 `{endpoint, key?, syncEnabled?, sources?}` |
+| `POST` | `/api/tenrouter/test` | 测试 10Router 连通性与 Key 有效性 |
+| `GET` | `/api/tenrouter/quotas` | 获取 10Router 聚合的外部供应商配额总览 |
+| `GET` | `/api/tenrouter/health` | 检查 10Router 服务端自身健康状态 |
+| `POST` | `/api/tenrouter/sync` | 立即触发本机模型用量向 10Router 同步 |
+| `POST` | `/api/tenrouter/sync-accounts` | 把本机账号推送到 10Router 连接 `{adminPassword?}`（OAuth / apikey 双通道） |
+| `GET` / `POST` | `/api/qoder/umid` | 获取 / 一键安装 Linux 平台 Qoder 设备身份组件 |
+| `GET` | `/api/cookie-sites` | 网页会话站点列表与已捕获账号（含探活痕迹 / 捕获时间） |
+| `POST` | `/api/cookie-sites/:id/capture` | 站点会话收割入库（桌面登录窗关闭时上报，余额/探测 API 即验证） |
+| `POST` | `/api/cookie-sites/:id/reprobe` | 用已存会话就地重探（身份 + 余额回填，免重登） |
+| `POST` | `/api/tenrouter/push-quota` | 立即向 10Router 推送一轮外部配额卡 |
+| `POST` | `/api/quota-refresh` | 10Router 卡面「刷新配额」回调（HMAC 签名 + 限流，凭据不出载荷） |
+| `GET` / `PUT` | `/api/{zcode,minimax,trae}-gateway` | 三个本地 Anthropic 兼容网关的配置与状态 |
+| `GET` | `/api/logs` | 查看环形内存日志（`?tag=MINIMAX-GW` / `?tag=ZCODE-GW` 可只看网关调用日志） |
+| `POST` | `/api/export` / `/api/import` | 账号数据安全加密导出与导入 |
+
+## 状态与记录说明
+
+| 状态 | 含义 | 当日记忆跳过 |
+|---|---|---|
+| `checked-in` | 领取成功（展示增加积分量） | ✓ 是（当日不再重复调用） |
+| `already` | 今日已完成领取 | ✓ 是（当日不再重复调用） |
+| `limited` | 国际版：本机当日额度已被其他账号占用 | ✓ 是（避免频繁受限） |
+| `no-activity` | 当前窗口暂无可领活动 | ✗ 否（下个调度周期重试） |
+| `failed` | 凭据失效或网络超时异常 | ✗ 否（下个调度周期重试） |
+
+> ⚠️ **声明**：本项目调用各平台自研及逆向接口，仅供个人多账号本地统筹管理，请严格遵守各平台服务条款，勿滥用于恶意刷取。
+
+## 项目结构
+
+```
+CreditDaddy/
+├── bin/
+│   └── creditdaddy.js          # CLI 执行入口
+├── desktop/                    # Electron 桌面壳工程（托盘、无痕授权窗口）
+│   ├── main.js
+│   ├── preload.js
+│   ├── preload-container.js
+│   ├── passwordStore.js
+│   └── package.json
+├── fnos-packaging/             # 飞牛 fnOS fpk 打包配置与声明
+│   ├── cmd/
+│   ├── config/
+│   └── manifest
+├── src/                        # 服务核心实现（纯标准库 ESM）
+│   ├── accounts.js             # 账号存储与生命周期管理
+│   ├── authDevice.js           # 网页 / 设备码授权分发中心
+│   ├── bgdaemon.js             # 后台实例启停与跨进程单实例守护
+│   ├── catpawClient.js         # 妙手桌面网关（用户信息 / 额度 / 套餐）请求
+│   ├── catpawLocal.js          # 本机妙手凭据 AES-GCM 解密与切号
+│   ├── checkin.js              # 自动轮询调度器
+│   ├── constants.js            # 服务接口与固定头常量
+│   ├── cookieSites.js          # 网页会话站点表（配置驱动捕获框架）
+│   ├── daemon.js               # 本地 HTTP API 与前端面板静态服务
+│   ├── externalQuota.js        # 10Router 外部配额卡推送（零凭据载荷）
+│   ├── i18n.js · i18n/         # 多语言运行时与词典（en/ja/ko/zh-TW）
+│   ├── localDetect.js          # 客户端已安装环境侦测
+│   ├── logger.js               # 内存环形日志与按日归档
+│   ├── longcatClient.js        # LongCat Token 资源包与身份请求
+│   ├── meooClient.js           # Meoo 秒悟每日首登积分与积分余额
+│   ├── mirasimClient.js        # mirasim 套餐 / 额度请求
+│   ├── mirasimLocal.js         # 本机 mirasim 凭据解密与切号
+│   ├── minimaxAuth.js          # MiniMax 浏览器登录（OAuth 设备码 + S256 PKCE）
+│   ├── minimaxClient.js        # MiniMax 用户信息 / 额度 / 签到 / Token 续期请求
+│   ├── minimaxGateway.js       # MiniMax 本地 Anthropic 兼容网关（多账号轮换）
+│   ├── minimaxLocal.js         # 本机 MiniMax 凭据读取、刷新对齐与安全回写
+│   ├── modelscopeClient.js     # ModelScope 魔搭余额与流水拆分
+│   ├── panel.html              # Web 管理面板前端
+│   ├── providers.js            # 多产品线适配器注册表
+│   ├── qoderApp.js             # 本机 Qoder 客户端探测与 safeStorage 解密
+│   ├── qoderClient.js          # Qoder 业务接口请求封装
+│   ├── qoderUmid.js            # UMID 设备组件提取与运行
+│   ├── quotaRefresh.js         # 10Router 卡面「刷新配额」签名回调服务
+│   ├── refreshGuard.js         # Token 刷新互斥守卫（轮换型 refresh 防踢）
+│   ├── riverClient.js          # River AI WorkOS 会话与 Billing 余额请求
+│   ├── store.js                # 0600 本机原子化配置存储引擎
+│   ├── tenrouter.js            # 10Router 配额查询与调度
+│   ├── tenrouterAccounts.js    # 账号一键推送为 10Router 连接（OAuth / apikey 双通道）
+│   ├── transfer.js             # 加密备份导入导出
+│   ├── traeClient.js           # Trae 签到 / 额度请求（设备码按 uid 派生）
+│   ├── traeGateway.js          # Trae 本地 Anthropic 兼容网关
+│   ├── traeLocal.js            # 本机 Trae「tc」信封凭据解密与切号
+│   ├── usageSync.js            # 本地多模型 SQLite 用量抽取
+│   ├── winProc.js              # Windows 进程探测（客户端在跑判定）
+│   ├── workbuddyAuth.js        # WorkBuddy 授权流程
+│   ├── workbuddyClient.js      # WorkBuddy 业务请求
+│   ├── workbuddyLocal.js       # 本机 WorkBuddy 会话拦截与切换
+│   ├── xiaomiMimoClient.js     # 小米 MiMo 控制台 UID 与余额请求
+│   ├── zcodeAuth.js            # ZCode 登录授权流程
+│   ├── zcodeAutoClaim.js       # ZCode 自动领活动与验证码处理
+│   ├── zcodeClient.js          # ZCode 权益与配额请求
+│   ├── zcodeGateway.js         # ZCode 本机网关（额度 / 活动代理）
+│   ├── zcodeLocal.js           # 本机 ZCode 会话切号（支持数据目录挪盘）
+│   └── zcrypto.js              # ZCode 本地凭据 AES-GCM 加解密
+└── test/                       # 自动化单元测试
+```
+
+## 测试
+
+```bash
+npm test
+```
+
+---
+
+## 🔗 相关项目
+
+- [🚀 10Router](https://github.com/techysy/10router) — 本地智能 AI 路由网关与用量仪表盘（集成 CreditDaddy 额度总览只读接口与用量计价）
+- [🌉 zcode-feishu-bridge](https://github.com/techysy/zcode-feishu-bridge) — ZCode 飞书流式卡片桥接守护进程
+- [🕊️ feige-fry-cards](https://github.com/techysy/feige-fry-cards) — 跨 Agent 战报结果汇总与多渠道路由插件
+
+---
+
+## 👥 交流群
+
+欢迎加入 **CreditDaddy 交流群** 交流使用体验与反馈 issue：
+
+<img src="assets/feishu-group-qr.jpg" width="280" alt="CreditDaddy 交流群二维码">
+
+### 贡献者致谢
+
+<p>
+  <a href="https://github.com/techysy" title="techysy — 主要维护者"><img src="https://github.com/techysy.png?size=160" width="80" height="80" alt="techysy" /></a>
+  <a href="https://github.com/gmplout" title="gmplout — 累计 4 个 issue（MiniMax 签到推送 / 隐私脱敏 RFC / 组合开关 RFC / 工具结果图片）"><img src="https://github.com/gmplout.png?size=160" width="80" height="80" alt="gmplout" /></a>
+  <a href="https://github.com/iMissNan" title="iMissNan — 累计 3 个 issue（zcode 修复 / 网关 Prompt 注入 / 隐私泄露）"><img src="https://github.com/iMissNan.png?size=160" width="80" height="80" alt="iMissNan" /></a>
+  <a href="https://github.com/fenixggg" title="fenixggg — 累计 3 个 issue（凭据解密互递归崩溃等）"><img src="https://github.com/fenixggg.png?size=160" width="80" height="80" alt="fenixggg" /></a>
+  <a href="https://github.com/muzimu217" title="muzimu217 — 2 个 issue + PR #44（CodeArts 签到 / 点数口径 / 安装路径探测）"><img src="https://github.com/muzimu217.png?size=160" width="80" height="80" alt="muzimu217" /></a>
+  <a href="https://github.com/snower" title="snower — issue #47 + PR #50（凭据解密互递归定位）"><img src="https://github.com/snower.png?size=160" width="80" height="80" alt="snower" /></a>
+  <a href="https://github.com/535408248-oss" title="535408248-oss — 累计 2 个 issue 反馈"><img src="https://github.com/535408248-oss.png?size=160" width="80" height="80" alt="535408248-oss" /></a>
+  <a href="https://github.com/sola237" title="sola237 — 累计 2 个 issue 反馈"><img src="https://github.com/sola237.png?size=160" width="80" height="80" alt="sola237" /></a>
+  <a href="https://github.com/cantinzing" title="cantinzing — 累计 2 个 issue 反馈"><img src="https://github.com/cantinzing.png?size=160" width="80" height="80" alt="cantinzing" /></a>
+  <a href="https://github.com/ma3252788" title="ma3252788 — 累计 2 个 issue 反馈"><img src="https://github.com/ma3252788.png?size=160" width="80" height="80" alt="ma3252788" /></a>
+  <a href="https://github.com/fioew" title="fioew — #1 首个 issue 反馈"><img src="https://github.com/fioew.png?size=160" width="80" height="80" alt="fioew" /></a>
+  <a href="https://github.com/JinsFoni" title="JinsFoni — #3 issue 反馈"><img src="https://github.com/JinsFoni.png?size=160" width="80" height="80" alt="JinsFoni" /></a>
+  <a href="https://github.com/zeonseoi" title="zeonseoi — #4 issue 反馈"><img src="https://github.com/zeonseoi.png?size=160" width="80" height="80" alt="zeonseoi" /></a>
+  <a href="https://github.com/rua-aaa" title="rua-aaa — #5 issue 反馈"><img src="https://github.com/rua-aaa.png?size=160" width="80" height="80" alt="rua-aaa" /></a>
+  <a href="https://github.com/Osinglehh" title="Osinglehh — #6 Workbuddy 国际端网址反馈"><img src="https://github.com/Osinglehh.png?size=160" width="80" height="80" alt="Osinglehh" /></a>
+  <a href="https://github.com/juyou1" title="juyou1 — #9 Qoder 国际版签到诉求"><img src="https://github.com/juyou1.png?size=160" width="80" height="80" alt="juyou1" /></a>
+  <a href="https://github.com/akahoz94" title="akahoz94 — PR #10"><img src="https://github.com/akahoz94.png?size=160" width="80" height="80" alt="akahoz94" /></a>
+  <a href="https://github.com/laojichao" title="laojichao — #16 Linux 客户端诉求"><img src="https://github.com/laojichao.png?size=160" width="80" height="80" alt="laojichao" /></a>
+  <a href="https://github.com/paynetsang" title="paynetsang — #17 issue 反馈"><img src="https://github.com/paynetsang.png?size=160" width="80" height="80" alt="paynetsang" /></a>
+  <a href="https://github.com/AJMstr" title="AJMstr — #25 issue 反馈"><img src="https://github.com/AJMstr.png?size=160" width="80" height="80" alt="AJMstr" /></a>
+  <a href="https://github.com/emo3o" title="emo3o — #34 issue 反馈"><img src="https://github.com/emo3o.png?size=160" width="80" height="80" alt="emo3o" /></a>
+  <a href="https://github.com/panxuewen0101" title="panxuewen0101 — #39 fnOS 窗口自定义 URL 提案"><img src="https://github.com/panxuewen0101.png?size=160" width="80" height="80" alt="panxuewen0101" /></a>
+  <a href="https://github.com/BrethofAI" title="BrethofAI — PR #36"><img src="https://github.com/BrethofAI.png?size=160" width="80" height="80" alt="BrethofAI" /></a>
+  <a href="https://github.com/JacksonJiangxh" title="JacksonJiangxh — 群内反馈"><img src="https://github.com/JacksonJiangxh.png?size=160" width="80" height="80" alt="JacksonJiangxh" /></a>
+</p>
+
+<sub>名单由 issue 与 PR 的反馈者及协同项目汇总，头像取自 GitHub 公开个人信息；PR 合入者另见 GitHub Contributors 统计；若有遗漏请随时提 issue 补充。</sub>
+
+
+
+---
+
+## 📄 许可证
+
+[MIT](LICENSE)

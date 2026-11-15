@@ -1,7 +1,10 @@
-FROM python:3.12-alpine
-ENV PYTHONUNBUFFERED=1 DATA_DIR=/data
+FROM node:20-alpine
+
+ENV CREDITDADDY_HOME=/data
 WORKDIR /app
-COPY *.py /app/
-VOLUME /data
-EXPOSE 8080
-CMD ["python", "-u", "app.py"]
+
+# 项目零运行时依赖，直接把源码放进镜像即可，不需要 npm install
+COPY . /app
+
+EXPOSE 47860
+CMD ["node", "bin/creditdaddy.js", "daemon", "--host", "0.0.0.0", "--port", "47860"]

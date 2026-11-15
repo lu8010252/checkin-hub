@@ -1,0 +1,893 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import fsSync from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+process.env.CREDITDADDY_HOME = await fs.mkdtemp(path.join(os.tmpdir(), 'creditdaddy-test-'));
+
+const { dayKey, msUntilNextTick } = await import('../src/checkin.js');
+const store = await import('../src/store.js');
+const { importAccounts, displayNameFrom } = await import('../src/accounts.js');
+const transfer = await import('../src/transfer.js');
+const qoderApp = await import('../src/qoderApp.js');
+const { rejectForeignRequest } = await import('../src/daemon.js');
+const { extractTokens } = await import('../src/localDetect.js');
+const { APP_VERSION } = await import('../src/constants.js');
+const catpawClient = await import('../src/catpawClient.js');
+
+test('dayKey 以 10:00 (UTC+8) 为签到日界，与本机时区无关', () => {
+  assert.match(dayKey(new Date('2026-09-23T10:00:00Z').getTime()), /^\d{4}-\d{2}-\d{2}$/);
+  // 10:00 (UTC+8) = 02:00 UTC
+  assert.equal(dayKey(new Date('2026-01-05T02:00:00Z').getTime()), '2026-01-05');
+  assert.equal(dayKey(new Date('2026-01-05T01:59:59Z').getTime()), '2026-01-04');
+  assert.equal(dayKey(new Date('2026-01-05T23:59:59Z').getTime()), '2026-01-05');
+});
+
+test('dayKey 按产品区分业务日界：Qoder 10:00，其余 00:00 (UTC+8)', () => {
+  // 北京 2026-01-05 09:00 = 01:00 UTC：Qoder 业务日仍是 01-04，WorkBuddy 已翻到 01-05
+  assert.equal(dayKey(new Date('2026-01-05T01:59:59Z').getTime(), 'qoder'), '2026-01-04');
+  assert.equal(dayKey(new Date('2026-01-05T01:59:59Z').getTime(), 'qoder-cn'), '2026-01-04');
+  assert.equal(dayKey(new Date('2026-01-05T01:59:59Z').getTime(), 'workbuddy'), '2026-01-05');
+  assert.equal(dayKey(new Date('2026-01-05T01:59:59Z').getTime(), 'mirasim'), '2026-01-05');
+  // 北京 2026-01-05 11:00 = 03:00 UTC：两口径都已翻日
+  assert.equal(dayKey(new Date('2026-01-05T03:00:00Z').getTime(), 'qoder'), '2026-01-05');
+  assert.equal(dayKey(new Date('2026-01-05T03:00:00Z').getTime(), 'workbuddy'), '2026-01-05');
+  // 北京 16:00 前后 = 0 点界翻日（00:00 界按北京日历日）
+  assert.equal(dayKey(new Date('2026-01-05T15:59:59Z').getTime(), 'workbuddy'), '2026-01-05');
+  assert.equal(dayKey(new Date('2026-01-05T16:00:00Z').getTime(), 'workbuddy'), '2026-01-06');
+});
+
+test('下次 tick 在 2h~2h10m 之间', async () => {
+  for (let i = 0; i < 20; i++) {
+    const ms = await msUntilNextTick(() => 0.5);
+    assert.ok(ms >= 2 * 3600_000 && ms <= 2 * 3600_000 + 10 * 60_000);
+  }
+});
+
+test('账号存储往返 + 去重 + 脱敏', async () => {
+  const accounts = [];
+  const a = store.normalizeAccountInput({ name: '测试', provider: 'qoder', token: 'jt-abcdef1234567890' });
+  accounts.push(a);
+  await store.saveAccounts(accounts);
+  const loaded = await store.loadAccounts();
+  assert.equal(loaded.length, 1);
+  assert.equal(loaded[0].token, 'jt-abcdef1234567890');
+
+  assert.ok(store.findDuplicate(loaded, 'qoder', 'jt-abcdef1234567890'));
+  assert.ok(!store.findDuplicate(loaded, 'qoder-cn', 'jt-abcdef1234567890'));
+
+  const pub = store.publicAccount(loaded[0]);
+  assert.ok(pub.tokenMasked.includes('...'));
+  assert.equal(pub.token, undefined, '脱敏视图不应泄露完整 token');
+  assert.equal(pub.isPat, false);
+});
+
+test('normalize 拒绝非法输入', () => {
+  assert.throws(() => store.normalizeAccountInput({ provider: 'qoder', token: '' }));
+  assert.throws(() => store.normalizeAccountInput({ provider: 'bogus', token: 'x' }));
+});
+
+test('PAT 识别', () => {
+  const a = store.normalizeAccountInput({ provider: 'qoder-cn', token: 'pt-xyz1234567890' });
+  assert.equal(store.publicAccount(a).isPat, true);
+});
+
+test('导出必须口令：无口令 / 短口令都拒绝', () => {
+  const a = store.normalizeAccountInput({ provider: 'qoder', token: 'jt-tok', uid: 'u-1', email: 'a@b.c' });
+  assert.throws(() => transfer.exportAccounts([a]), (e) => e.code === 'PASSWORD_REQUIRED');
+  assert.throws(() => transfer.exportAccounts([a], { password: '' }), (e) => e.code === 'PASSWORD_REQUIRED');
+  assert.throws(() => transfer.exportAccounts([a], { password: '123' }), (e) => e.code === 'PASSPHRASE_TOO_SHORT');
+});
+
+test('载荷构建不含 id，兼容新旧字段', () => {
+  const a = store.normalizeAccountInput({ provider: 'qoder', token: 'jt-tok', uid: 'u-1', email: 'a@b.c' });
+  const payload = transfer.buildExportPayload([a]);
+  assert.equal(payload.format, 'creditdaddy-accounts');
+  assert.equal(payload.provider, 'qoder');
+  assert.equal(payload.accounts[0].id, undefined);
+  assert.equal(payload.accounts[0].token, 'jt-tok');
+  assert.equal(payload.accounts[0].accessToken, 'jt-tok');
+  assert.equal(payload.accounts[0].providerSpecificData.userId, 'u-1');
+});
+
+test('Loomy 同步载荷带 authType:apikey——10R 原生 loomy 行就是 apikey 形态，不带会落成 oauth 丢凭据', () => {
+  const a = store.normalizeAccountInput({ provider: 'loomy', token: 'lmtok'.repeat(6) + 'ab', uid: '261030162018707426' });
+  const row = transfer.buildExportPayload([a]).accounts[0];
+  assert.equal(row.authType, 'apikey');
+  const q = transfer.buildExportPayload([store.normalizeAccountInput({ provider: 'qoder', token: 'jt-1' })]).accounts[0];
+  assert.equal(q.authType, undefined);
+});
+
+test('灵犀/DuMate 网页会话行带 authType:cookie——10R 导入端据此把凭据落 apiKey（webCookie executor 读取字段）', () => {
+  const lx = transfer.buildExportPayload([
+    store.normalizeAccountInput({ provider: 'lingxi', token: 'wps_sid=abc; uid=1927751197', uid: '1927751197' }),
+  ]).accounts[0];
+  assert.equal(lx.authType, 'cookie');
+  assert.ok(lx.accessToken.startsWith('wps_sid='));
+  const dm = transfer.buildExportPayload([
+    store.normalizeAccountInput({ provider: 'dumate', token: 'dt-cookie-jar' }),
+  ]).accounts[0];
+  assert.equal(dm.authType, 'cookie');
+});
+
+test('Qoder 网页会话随导出进 providerSpecificData，回导入恢复进 meta', () => {
+  const a = store.normalizeAccountInput({ provider: 'qoder-cn', token: 'dt-web-sync', uid: 'u-web' });
+  a.meta = { qoderWebSession: { cookie: 'session=abc; x=1', capturedAt: '2026-09-30T11:47:56.904Z' } };
+  const payload = transfer.buildExportPayload([a]);
+  const psd = payload.accounts[0].providerSpecificData;
+  assert.equal(psd.creditDaddyWebSession.cookie, 'session=abc; x=1');
+  assert.equal(psd.creditDaddyWebSession.userId, 'u-web');
+  // 往返：parseImport 把 psd 里的会话捡回 meta.qoderWebSession
+  const parsed = transfer.parseImport(payload);
+  assert.equal(parsed.accounts[0].meta.qoderWebSession.cookie, 'session=abc; x=1');
+  // 10router 形态（无 meta 字段，只有 psd）也能恢复
+  const as10r = { format: 'x', provider: 'qoder-cn', accounts: [{ accessToken: 'dt-web-sync', providerSpecificData: psd }] };
+  assert.equal(transfer.parseImport(as10r).accounts[0].meta.qoderWebSession.cookie, 'session=abc; x=1');
+  // 非 qoder 产品不带会话；无会话的 qoder 账号 psd 里没有该键
+  const noSession = store.normalizeAccountInput({ provider: 'qoder', token: 'dt-none', uid: 'u-n' });
+  assert.equal(transfer.buildExportPayload([noSession]).accounts[0].providerSpecificData.creditDaddyWebSession, undefined);
+});
+
+test('publicAccount：qoderWebCapturedAt 只回会话时间戳，绝不回 Cookie（10Router issue #44）', () => {
+  const withSession = store.normalizeAccountInput({ provider: 'qoder', token: 'jt-tok', uid: 'u-1' });
+  withSession.meta = { qoderWebSession: { cookie: 'session=abc; x=1', capturedAt: '2026-09-30T11:47:56.904Z' } };
+  const pub = store.publicAccount(withSession);
+  assert.equal(pub.qoderWebCapturedAt, '2026-09-30T11:47:56.904Z');
+  assert.ok(!JSON.stringify(pub).includes('session=abc'), '脱敏视图不得泄露网页 Cookie');
+
+  const noSession = store.normalizeAccountInput({ provider: 'qoder-cn', token: 'jt-tok2', uid: 'u-2' });
+  assert.equal(store.publicAccount(noSession).qoderWebCapturedAt, null, '有账号无会话 → null（面板据此提示缺失）');
+
+  const other = store.normalizeAccountInput({ provider: 'workbuddy', token: 'jt-tok3' });
+  other.meta = { qoderWebSession: { cookie: 'x', capturedAt: 't' } };
+  assert.equal(store.publicAccount(other).qoderWebCapturedAt, null, '非 qoder 产品恒为 null');
+});
+
+test('加密导出往返（10router-oauth-secure-v1）', () => {
+  const a = store.normalizeAccountInput({ provider: 'qoder-cn', token: 'dt-secret-token-xyz', refreshToken: 'rt' });
+  const blob = JSON.parse(JSON.stringify(transfer.exportAccounts([a], { password: 'pass1234' })));
+  assert.equal(blob.format, '10router-oauth-secure-v1');
+  assert.ok(!JSON.stringify(blob).includes('dt-secret'), '加密文件不应含明文 token');
+  const parsed = transfer.parseImport(blob, { password: 'pass1234' });
+  assert.equal(parsed.source, 'creditdaddy');
+  assert.equal(parsed.accounts[0].token, 'dt-secret-token-xyz');
+  assert.equal(parsed.accounts[0].refreshToken, 'rt');
+  assert.throws(() => transfer.parseImport(blob, { password: 'nope' }), (e) => e.code === 'WRONG_PASSWORD');
+  assert.throws(() => transfer.parseImport(blob, {}), (e) => e.code === 'NEED_PASSWORD');
+  assert.throws(() => transfer.exportAccounts([a], { password: '123' }), (e) => e.code === 'PASSPHRASE_TOO_SHORT');
+});
+
+test('导入 10router 迁移文件：只取 qoder 账号、丢弃合成邮箱', () => {
+  const blob = transfer.sealTransfer({
+    provider: 'qoder-cn',
+    accounts: [
+      { accessToken: 'dt-cn-1', email: 'qoder-cn-user-42', name: '小号', providerSpecificData: { userId: '42' }, expiresAt: 1790000000 },
+      { provider: 'cursor', accessToken: 'x' },
+      { refreshToken: 'only-refresh' },
+    ],
+  }, 'pw-10router');
+  const r = transfer.parseImport(blob, { password: 'pw-10router' });
+  assert.equal(r.source, '10router');
+  assert.equal(r.accounts.length, 1);
+  assert.equal(r.skipped, 2);
+  assert.deepEqual(
+    { p: r.accounts[0].provider, e: r.accounts[0].email, u: r.accounts[0].uid, n: r.accounts[0].name },
+    { p: 'qoder-cn', e: null, u: '42', n: '小号' });
+  assert.equal(store.normalizeAccountInput(r.accounts[0]).expiresAt, new Date(1790000000 * 1000).toISOString());
+});
+
+test('导入 workbuddy-switch 导出的明文备份文件：自动推断 provider 并还原 session 结构', () => {
+  const sample = [
+    {
+      domain: 'www.workbuddy.cn',
+      uid: 'u-1',
+      nickname: '测试用户1',
+      access_token: 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1LTEiLCJpc3MiOiJodHRwczovL3d3dy53b3JrYnVkZHkuY24vYXV0aCJ9.dummy',
+      refresh_token: 'rt-1',
+      expiresAt: 1793943730000,
+      auth_raw: {
+        account: { uid: 'u-1', nickname: '测试用户1' },
+        auth: { accessToken: 'token-inner', refreshToken: 'rt-1', domain: 'www.workbuddy.cn' }
+      }
+    },
+    {
+      domain: 'www.codebuddy.ai',
+      uid: 'u-intl',
+      nickname: 'IntlUser',
+      access_token: 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1LWludGwiLCJpc3MiOiJodHRwczovL3d3dy5jb2RlYnVkZHkuYWkvYXV0aCJ9.dummy',
+      refresh_token: 'rt-2',
+      expiresAt: 1793943730000,
+    }
+  ];
+  const r = transfer.parseImport(sample);
+  assert.equal(r.source, 'wb-switch');
+  assert.equal(r.accounts.length, 2);
+  assert.equal(r.skipped, 0);
+  assert.equal(r.accounts[0].provider, 'workbuddy');
+  assert.equal(r.accounts[0].name, '测试用户1');
+  assert.equal(r.accounts[0].uid, 'u-1');
+  assert.equal(r.accounts[0].refreshToken, 'rt-1');
+  assert.ok(r.accounts[0].meta?.session?.account);
+  assert.equal(r.accounts[1].provider, 'workbuddy-intl');
+  assert.equal(r.accounts[1].name, 'IntlUser');
+  assert.equal(r.accounts[1].uid, 'u-intl');
+  assert.ok(r.accounts[1].meta?.session?.account);
+});
+
+test('同一 uid 的新 token 视为续期而不是新增', async () => {
+  await store.saveAccounts([]);
+  await importAccounts([{ provider: 'qoder', token: 'dt-old', uid: 'same-user', name: '原名' }]);
+  const r = await importAccounts([{ provider: 'qoder', token: 'dt-new', uid: 'same-user', name: '新名', expiresAt: '2030-01-01T00:00:00Z' }]);
+  assert.deepEqual(r, { added: 0, updated: 1, skipped: 0 });
+  const list = await store.loadAccounts();
+  assert.equal(list.length, 1);
+  assert.equal(list[0].token, 'dt-new');
+  assert.equal(list[0].name, '原名', '续期保留原备注名');
+  assert.equal(list[0].expiresAt, '2030-01-01T00:00:00.000Z');
+});
+
+test('Qoder 客户端身份字段格式', () => {
+  assert.match(qoderApp.machineOs(), /^[a-z0-9_]+_(win32|darwin|linux)$/);
+  assert.equal(qoderApp.machineHostname('MX-PC'), 'MX-PC');
+  assert.match(qoderApp.machineHostname('我的电脑'), /^unknown-[0-9a-f]{8}$/);
+  assert.equal(qoderApp.machineHostname('x'.repeat(200)).length, 96);
+  assert.match(qoderApp.machineId('qoder'), /^[0-9a-f-]{36}$/);
+});
+
+test('withAccounts 并发修改不丢数据', async () => {
+  await store.saveAccounts([]);
+  await Promise.all(Array.from({ length: 20 }, (_, i) =>
+    store.withAccounts((list) => {
+      list.push(store.normalizeAccountInput({ provider: 'qoder', token: `jt-concurrent-${i}` }));
+    })));
+  assert.equal((await store.loadAccounts()).length, 20);
+});
+
+test('批量导入去重并跳过非法项', async () => {
+  await store.saveAccounts([]);
+  const r = await importAccounts([
+    { provider: 'qoder', token: 'jt-a' },
+    { provider: 'qoder', token: 'jt-a' },
+    { provider: 'qoder-cn', token: 'jt-a' },
+    { provider: 'bogus', token: 'jt-b' },
+  ]);
+  assert.deepEqual(r, { added: 2, updated: 0, skipped: 2 });
+});
+
+test('displayNameFrom 选取首个非空字段', () => {
+  assert.equal(displayNameFrom({ nickname: ' ', name: '小明', email: 'a@b.c' }), '小明');
+  assert.equal(displayNameFrom({ email: 'a@b.c' }), 'a@b.c');
+  assert.equal(displayNameFrom(null), null);
+});
+
+test('本机模式拒绝 DNS 重绑定与跨站请求', () => {
+  const bind = '127.0.0.1';
+  assert.equal(rejectForeignRequest({ host: '127.0.0.1:47860' }, bind), null);
+  assert.equal(rejectForeignRequest({ host: 'localhost:47860', origin: 'http://localhost:47860' }, bind), null);
+  assert.equal(rejectForeignRequest({ host: '[::1]:47860' }, bind), null);
+  assert.ok(rejectForeignRequest({ host: 'evil.example.com' }, bind), '陌生 Host 应被拒绝');
+  assert.ok(rejectForeignRequest({ host: '127.0.0.1:47860', origin: 'https://evil.example.com' }, bind), '跨站 Origin 应被拒绝');
+  // NAS 模式（0.0.0.0）未设访问密钥时：本机地址 / 主机名的 Host 放行，外部域名拒绝（防 DNS 重绑定）
+  assert.equal(rejectForeignRequest({ host: `${os.hostname()}:47860` }, '0.0.0.0'), null);
+  assert.equal(rejectForeignRequest({ host: 'localhost:47860' }, '0.0.0.0'), null);
+  assert.ok(rejectForeignRequest({ host: 'evil.example.com' }, '0.0.0.0'), '0.0.0.0 无密钥时外部域名 Host 应被拒绝');
+  assert.ok(rejectForeignRequest({ host: '192.168.1.10:47860', origin: 'http://evil.lan' }, '0.0.0.0'), '跨站 Origin 仍应被拒绝');
+});
+
+test('quota-refresh 回调豁免跨站 Origin（HMAC 自鉴权），Host 闸照常', () => {
+  const bind = '127.0.0.1';
+  // 10R 配额卡按钮浏览器直连：Origin 必然外站，该路径放行（防伪交给签名+限流）
+  assert.equal(rejectForeignRequest({ host: '127.0.0.1:47860', origin: 'https://10router.example.com' }, bind, '/api/quota-refresh'), null);
+  // 其余 API 路径跨站照拒（豁免只给回调）
+  assert.ok(rejectForeignRequest({ host: '127.0.0.1:47860', origin: 'https://10router.example.com' }, bind, '/api/accounts'), '其他路径跨站仍应被拒绝');
+  // Host 闸不豁免：DNS 重绑定照挡
+  assert.ok(rejectForeignRequest({ host: 'evil.example.com', origin: 'https://10router.example.com' }, bind, '/api/quota-refresh'), '回调路径陌生 Host 仍应被拒绝');
+});
+
+test('extractTokens 提取并去重 dt-/pt- token', () => {
+  const text = 'a dt-AAAAAAAAAAAAAAAAAAAA b pt-BBBBBBBBBBBBBBBBBBBB dt-AAAAAAAAAAAAAAAAAAAA dt-short';
+  assert.deepEqual(extractTokens(text).sort(), ['dt-AAAAAAAAAAAAAAAAAAAA', 'pt-BBBBBBBBBBBBBBBBBBBB']);
+});
+
+test('APP_VERSION 与 package.json 一致', async () => {
+  const pkg = JSON.parse(await fs.readFile(new URL('../package.json', import.meta.url), 'utf8'));
+  assert.equal(APP_VERSION, pkg.version);
+});
+
+// ── WorkBuddy ──
+const wbClient = await import('../src/workbuddyClient.js');
+const wbLocal = await import('../src/workbuddyLocal.js');
+const { normalizeQoderQuota } = await import('../src/providers.js');
+
+const fakeJwt = (claims) => ['e30', Buffer.from(JSON.stringify(claims)).toString('base64url'), 'sig'].join('.');
+
+test('WorkBuddy token 按签发方识别国内版 / 国际版', () => {
+  const cn = wbClient.inspectToken(fakeJwt({ iss: 'https://www.codebuddy.cn/auth/realms/copilot', sub: 'u-cn', exp: 1790000000 }));
+  assert.equal(cn.provider, 'workbuddy');
+  assert.equal(cn.uid, 'u-cn');
+  assert.equal(cn.host, 'www.codebuddy.cn');
+  assert.equal(wbClient.inspectToken(fakeJwt({ iss: 'https://www.workbuddy.cn/auth/realms/copilot' })).provider, 'workbuddy');
+  assert.equal(wbClient.inspectToken(fakeJwt({ iss: 'https://www.codebuddy.ai/auth/realms/x' })).provider, 'workbuddy-intl');
+  assert.equal(wbClient.inspectToken(fakeJwt({ iss: 'https://www.workbuddy.ai/auth/realms/x' })).provider, 'workbuddy-intl');
+  assert.equal(wbClient.inspectToken(fakeJwt({ iss: 'https://workbuddy.cc/auth/realms/x' })).provider, 'workbuddy-intl');
+  assert.equal(wbClient.inspectToken('dt-not-a-jwt').provider, null);
+  assert.equal(wbClient.apiHost({ provider: 'workbuddy', token: fakeJwt({ iss: 'https://copilot.tencent.com/auth' }), meta: {} }), 'www.codebuddy.cn');
+});
+
+test('WorkBuddy 会话文件 → 账号记录（保留会话以便切换）', async () => {
+  const token = fakeJwt({ iss: 'https://www.workbuddy.cn/auth/realms/copilot', sub: 'u-1', exp: 1790000000 });
+  const rec = await wbLocal.sessionToAccount({
+    account: { uid: 'u-1', nickname: '小明', phoneNumber: '13800001234', enterpriseId: '' },
+    auth: { accessToken: token, refreshToken: 'r-1', expiresAt: 1790000000000, domain: 'www.workbuddy.cn', tokenType: 'Bearer' },
+    accounts: [{ uid: 'u-1' }],
+  }, 'test');
+  assert.equal(rec.provider, 'workbuddy');
+  assert.equal(rec.name, '小明');
+  assert.equal(rec.refreshToken, 'r-1');
+  assert.equal(rec.meta.domain, 'www.workbuddy.cn');
+  assert.equal(rec.meta.session.auth.accessToken, undefined, '会话副本里不重复存 token');
+  assert.equal(rec.meta.session.auth.tokenType, 'Bearer');
+  const pub = store.publicAccount(store.normalizeAccountInput(rec));
+  assert.equal(pub.product, 'workbuddy');
+  assert.equal(pub.phone, '138****1234');
+  assert.equal(pub.canSwitch, true);
+  assert.equal(JSON.stringify(pub).includes('r-1'), false, '脱敏视图不含 refreshToken');
+});
+
+test('mirasim：正确注册到产品线与适配器', async () => {
+  const { productImpl } = await import('../src/providers.js');
+  const { productOf, PROVIDERS } = await import('../src/constants.js');
+  assert.ok(PROVIDERS.includes('mirasim'));
+  assert.equal(productOf('mirasim'), 'mirasim');
+  const impl = productImpl('mirasim');
+  assert.equal(impl.label, 'mirasim');
+  assert.equal(typeof impl.quota, 'function');
+  assert.equal(typeof impl.verify, 'function');
+
+  const acc = store.normalizeAccountInput({
+    provider: 'mirasim',
+    token: 'test-token',
+    uid: 'usr_123',
+    name: '我的mirasim',
+  });
+  assert.equal(acc.provider, 'mirasim');
+  const pub = store.publicAccount(acc);
+  assert.equal(pub.product, 'mirasim');
+  assert.equal(pub.name, '我的mirasim');
+});
+
+test('catpaw：正确注册到产品线与适配器（无签到、可切换）', async () => {
+  const { productImpl } = await import('../src/providers.js');
+  const { productOf, PROVIDERS } = await import('../src/constants.js');
+  assert.ok(PROVIDERS.includes('catpaw'));
+  assert.equal(productOf('catpaw'), 'catpaw');
+  const impl = productImpl('catpaw');
+  assert.equal(impl.label, '妙手');
+  assert.equal(typeof impl.quota, 'function');
+  assert.equal(typeof impl.verify, 'function');
+  assert.equal(impl.checkin, undefined, '妙手按套餐发放 Credits，无每日签到');
+
+  const acc = store.normalizeAccountInput({ provider: 'catpaw', token: 'cp-test-token', uid: '704460616', name: '余师洋_' });
+  assert.equal(acc.provider, 'catpaw');
+  const pub = store.publicAccount(acc);
+  assert.equal(pub.product, 'catpaw');
+  assert.equal(pub.name, '余师洋_');
+  assert.equal(pub.canSwitch, true, '妙手账号凭本机加密文件切换');
+  assert.ok(!pub.tokenMasked.includes('test-token'), '脱敏视图不保留完整 token 中段');
+});
+
+test('catpaw 额度解析：套餐 Credits / 下次刷新 / 空额度与过期套餐', () => {
+  const q = catpawClient.normalizeCatpawBalance({
+    availableCredits: '1195.85',
+    userPlan: { planId: 'plan_free', planName: '体验版', pro: false, status: 'active', autoRenew: false, expireTime: null, nextRefreshTime: 1790784000000 },
+  });
+  assert.deepEqual({ r: q.remaining, u: q.unit, plan: q.plan, n: q.parts.length }, { r: 1195.85, u: 'Credits', plan: '体验版', n: 1 });
+  assert.equal(q.empty, false);
+  assert.equal(q.exceeded, false);
+  assert.equal(q.pro, false);
+  assert.equal(q.autoRenew, false);
+  assert.equal(q.planExpiresAt, null);
+  assert.equal(q.nextRefreshAt, new Date(1790784000000).toISOString());
+  assert.equal(q.parts[0].recurring, true);
+
+  const e = catpawClient.normalizeCatpawBalance({ availableCredits: null, userPlan: { status: 'expired', pro: true } });
+  assert.equal(e.empty, true);
+  assert.equal(e.exceeded, true);
+  assert.equal(e.plan, '专业版', 'planName 缺失时按 pro 兜底');
+});
+
+test('catpaw 网关：信封拆分与 401 → 凭据失效（auth 标记）', async () => {
+  const m = mockFetch([
+    [/\/api\/gateway\/credit\/balance$/, () => ({ body: { code: 0, data: { availableCredits: '10.5', userPlan: { planName: '体验版', status: 'active' } } } })],
+    [/\/api\/gateway\/auth\/current-user$/, () => ({ status: 401, body: {} })],
+  ]);
+  try {
+    const q = await catpawClient.fetchCatpawQuota({ token: 't' });
+    assert.equal(q.remaining, 10.5);
+    assert.equal(q.plan, '体验版');
+    await assert.rejects(catpawClient.fetchCatpawProfile('t'), (err) => err.auth === true && /重新登录/.test(err.message));
+  } finally { m.restore(); }
+});
+
+test('catpaw 凭据文件：AES-256-GCM 加解密互逆 + 切换（测试钩子注入机器 ID）', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'catpaw-cred-'));
+  const file = path.join(dir, 'catx-credential.json');
+  const catpawLocal = await import('../src/catpawLocal.js');
+  process.env.CATPAW_CREDENTIAL_FILE = file;
+  try {
+    catpawLocal._setMachineIdForTests('test-machine-id');
+    catpawLocal._setRunningForTests(false);   // 本机可能真的开着妙手，屏蔽真实进程探测
+    assert.equal(catpawLocal.readCredential(), null, '文件不存在 → null');
+    assert.equal(catpawLocal.currentCatpawToken(), null);
+    catpawLocal._writeCredentialForTests('access-token-A');
+    catpawLocal._writeCredentialForTests('access-token-B');
+    const cred = catpawLocal.readCredential();
+    assert.equal(cred.accessToken, 'access-token-B', '后一次写入覆盖前一次（各自随机 IV）');
+    assert.ok(cred.modifiedAt > 0);
+    assert.equal(catpawLocal.currentCatpawToken(), 'access-token-B');
+    // 密文不是明文 token 的 base64 可逆形式
+    assert.ok(!Buffer.from(JSON.parse(await fs.readFile(file, 'utf8')).ssoTokenEnc, 'base64').includes(Buffer.from('access-token')));
+
+    const r = await catpawLocal.switchTo({ provider: 'catpaw', token: 'access-token-A' });
+    assert.equal(r.switched, true);
+    assert.equal(catpawLocal.readCredential().accessToken, 'access-token-A');
+    const again = await catpawLocal.switchTo({ provider: 'catpaw', token: 'access-token-A' });
+    assert.deepEqual({ s: again.switched, a: again.alreadyActive }, { s: false, a: true });
+    // 客户端运行中：默认拒绝，force 放行
+    catpawLocal._setRunningForTests(true);
+    await assert.rejects(catpawLocal.switchTo({ provider: 'catpaw', token: 'access-token-C' }),
+      (err) => err.catpawRunning === true && /正在运行/.test(err.message));
+    const forced = await catpawLocal.switchTo({ provider: 'catpaw', token: 'access-token-C' }, { force: true });
+    assert.equal(forced.switched, true);
+    catpawLocal._setRunningForTests(null);
+    await fs.rm(file);
+    await assert.rejects(catpawLocal.switchTo({ provider: 'catpaw', token: 'no-file' }), /没有可用的登录凭据/);
+  } finally {
+    catpawLocal._setMachineIdForTests(null);
+    delete process.env.CATPAW_CREDENTIAL_FILE;
+  }
+});
+
+test('Qoder 配额归一化为统一积分结构', () => {
+  const q = normalizeQoderQuota({
+    userQuota: { total: 0, used: 0, remaining: 0 },
+    addOnQuota: { total: 200, used: 100, remaining: 100 },
+    isQuotaExceeded: false, expiresAt: 253402214400000,
+  });
+  assert.deepEqual({ t: q.total, u: q.used, r: q.remaining, n: q.parts.length }, { t: 200, u: 100, r: 100, n: 1 });
+  assert.equal(q.parts[0].expiresAt, null, '“永不过期”哨兵值不当作到期时间');
+});
+
+test('Qoder 网页端明细可用时按逐资源包展开（含各自到期时间）', () => {
+  const agg = {
+    userQuota: { total: 0, used: 0, remaining: 0 },
+    addOnQuota: { total: 900, used: 876, remaining: 24 },
+    isQuotaExceeded: false, expiresAt: 253402214400000,
+  };
+  // 真实抓包的 /api/v2/me/usages/big_model_credits 结构（yu_shiyang，2026-09-30）
+  const detail = {
+    user_id: '01a045ad-c952-7079-b3be-9fe2a842e023',
+    plan_quota: { quota_detail: [{ limit_value: 0, used_value: 0, remaining_value: 0, source: 'PLAN', expires_at: 0 }] },
+    resource_package_quota: { quota_detail: [
+      { limit_value: 100, used_value: 76, remaining_value: 24, source: 'RESOURCE_PACKAGE_SOURCE_BONUS', expires_at: 1792635167844 },
+      { limit_value: 500, used_value: 500, remaining_value: 0, source: 'RESOURCE_PACKAGE_SOURCE_BONUS', expires_at: 1790783939000 },
+    ] },
+    dedicated_resource_package_quota: { quota_detail: null },
+  };
+  const q = normalizeQoderQuota(agg, detail);
+  assert.deepEqual({ t: q.total, u: q.used, r: q.remaining, n: q.parts.length }, { t: 600, u: 576, r: 24, n: 2 });
+  assert.equal(q.parts[0].name, '获赠资源包');
+  assert.ok(q.parts[0].expiresAt && q.parts[0].expiresAt.startsWith('2026-10-22'), '每包保留自己的到期时间');
+  assert.equal(q.parts[1].remaining, 0);
+  // 无明细时回落聚合数据（fnOS / 未登录网页的账号）
+  const fallback = normalizeQoderQuota(agg, null);
+  assert.deepEqual({ t: fallback.total, u: fallback.used, r: fallback.remaining, n: fallback.parts.length }, { t: 900, u: 876, r: 24, n: 1 });
+  // 明细里全是 0（新用户）也回落聚合而不是显示空列表
+  const emptyDetail = { plan_quota: { quota_detail: [] }, resource_package_quota: { quota_detail: [] } };
+  assert.equal(normalizeQoderQuota(agg, emptyDetail).parts.length, 1);
+});
+
+test('导入：10router codebuddy-* 映射为 WorkBuddy，兼容更名前的 QoderDaddy 导出', () => {
+  const blob = transfer.sealTransfer({ provider: 'codebuddy-cn', accounts: [{ accessToken: 'eyJ.a.b', name: 'cb' }] }, 'pw-10r');
+  const r = transfer.parseImport(blob, { password: 'pw-10r' });
+  assert.equal(r.accounts[0].provider, 'workbuddy');
+  const legacy = transfer.parseImport({ format: 'qoderdaddy-accounts', accounts: [{ provider: 'qoder', token: 'dt-legacy' }] });
+  assert.equal(legacy.source, 'creditdaddy');
+  assert.equal(legacy.accounts[0].token, 'dt-legacy');
+  const legacySealed = transfer.sealTransfer({ format: 'qoderdaddy-accounts', accounts: [{ provider: 'qoder', token: 'dt-x' }] }, 'pw-old');
+  assert.equal(transfer.parseImport(legacySealed, { password: 'pw-old' }).source, 'creditdaddy');
+});
+
+test('detectWorkbuddy：凭据目录存在但无客户端 exe 时 installed 为 false（切换守卫依据）', async () => {
+  const wb = await import('../src/workbuddyLocal.js');
+  // CI / 无 WorkBuddy 客户端的机器：没有 exe 也没有会话 → 未安装
+  // （凭据目录可能因历史静默切换被 mkdir 出来——目录存在不能当「已安装」）
+  const d = wb.detectWorkbuddy();
+  assert.equal(typeof d.installed, 'boolean');
+  assert.equal(typeof d.signedIn, 'boolean');
+  assert.equal(d.dirExists, fsSync.existsSync(d.dir));
+  // 没有客户端 exe 时：Linux/macOS 无候选路径 → installed 只能由「有会话」兜底；
+  // Windows 上无 exe 且无当前会话 → 必为 false（CreditDaddy mkdir 出的空壳目录不算）
+  if (!d.clientPath && !d.signedIn) {
+    const hasCliCandidates = process.platform !== 'linux';
+    if (!hasCliCandidates) assert.equal(d.installed, false);
+  }
+});
+
+test('切换 WorkBuddy 账号：写入当前会话并清除登出标记', async () => {
+  const fake = await fs.mkdtemp(path.join(os.tmpdir(), 'wb-auth-'));
+  const saved = { LOCALAPPDATA: process.env.LOCALAPPDATA, XDG_DATA_HOME: process.env.XDG_DATA_HOME, HOME: process.env.HOME };
+  process.env.LOCALAPPDATA = fake;
+  process.env.XDG_DATA_HOME = fake;
+  try {
+    const dir = wbLocal.workbuddyAuthDir();
+    if (process.platform === 'darwin') return; // macOS 路径固定在 ~/Library，跳过
+    await fs.mkdir(dir, { recursive: true });
+    const tokA = fakeJwt({ iss: 'https://www.codebuddy.cn/auth/realms/copilot', sub: 'A', exp: 1890000000 });
+    const tokB = fakeJwt({ iss: 'https://www.codebuddy.cn/auth/realms/copilot', sub: 'B', exp: 1890000000 });
+    const cur = path.join(dir, 'workbuddy-desktop.info');
+    await fs.writeFile(cur, JSON.stringify({ account: { uid: 'A', nickname: 'A' }, auth: { accessToken: tokA, refreshToken: 'rA', domain: 'www.codebuddy.cn' }, accounts: [] }));
+    await fs.writeFile(path.join(dir, 'workbuddy-desktop.2026-08-01T00-00-00-000Z.1.x.info'),
+      JSON.stringify({ account: { uid: 'B', nickname: 'B' }, auth: { accessToken: tokB, refreshToken: 'rB', domain: 'www.codebuddy.cn' }, accounts: [] }));
+    const found = await wbLocal.readWorkbuddySessions();
+    assert.deepEqual(found.accounts.map((a) => [a.uid, a.current]), [['A', true], ['B', false]]);
+    assert.equal(await wbLocal.currentWorkbuddyUid(), 'A');
+
+    await fs.writeFile(cur + '.logged-out', 'x');
+    const target = store.normalizeAccountInput(found.accounts[1]);
+    const r = await wbLocal.writeWorkbuddySession(target);
+    assert.equal(r.previousUid, 'A');
+    const written = JSON.parse(await fs.readFile(cur, 'utf8'));
+    assert.equal(written.account.uid, 'B');
+    assert.equal(written.auth.accessToken, tokB);
+    assert.equal(written.auth.refreshToken, 'rB');
+    await assert.rejects(fs.access(cur + '.logged-out'), '登出标记应被清除');
+    assert.equal(await wbLocal.currentWorkbuddyUid(), 'B');
+  } finally {
+    Object.assign(process.env, saved);
+    for (const [k, v] of Object.entries(saved)) if (v === undefined) delete process.env[k];
+  }
+});
+
+// ── ZCode ──
+const zc = await import('../src/zcrypto.js');
+const zcodeClient = await import('../src/zcodeClient.js');
+const nodeCrypto = await import('node:crypto');
+
+/** 与 ZCode 客户端相同格式的加密（测试用）：enc:v1:<nonce>.<tag>.<ct>，base64url，AES-256-GCM(key=SHA256(secret)) */
+function zEncrypt(plain, secret) {
+  const key = nodeCrypto.createHash('sha256').update(secret).digest();
+  const nonce = nodeCrypto.randomBytes(12);
+  const c = nodeCrypto.createCipheriv('aes-256-gcm', key, nonce);
+  const ct = Buffer.concat([c.update(plain, 'utf8'), c.final()]);
+  return `enc:v1:${nonce.toString('base64url')}.${c.getAuthTag().toString('base64url')}.${ct.toString('base64url')}`;
+}
+
+test('ZCode enc:v1 解密与身份提取', () => {
+  const secret = 'zcode-credential-fallback:win32:C:\Users\t:t';
+  const creds = {
+    'oauth:active_provider': zEncrypt('bigmodel', secret),
+    'oauth:bigmodel:user_info': zEncrypt(JSON.stringify({ id: 42, username: 'alice', displayName: '爱丽丝' }), secret),
+    'oauth:bigmodel:access_token': zEncrypt('eyJ.x.y', secret),
+    zcodejwttoken: zEncrypt('jwt-value-longer-than-twenty-chars', secret),
+  };
+  assert.equal(zc.decryptWithSecret(creds['oauth:active_provider'], secret), 'bigmodel');
+  assert.throws(() => zc.decryptWithSecret(creds['oauth:active_provider'], 'wrong-secret'));
+  assert.equal(zc.safeDecrypt('plain-text', secret), 'plain-text');
+  assert.equal(zc.safeDecrypt(creds.zcodejwttoken, 'wrong'), null);
+  const id = zc.identityWithSecret(creds, secret);
+  assert.deepEqual({ p: id.provider, u: id.userId, n: zc.identityLabel(id) }, { p: 'bigmodel', u: '42', n: '爱丽丝' });
+  assert.equal(zc.isLoggedIn(creds), true);
+  assert.equal(zc.isLoggedIn({ zcodejwttoken: '  ' }), false);
+  assert.equal(zc.defaultSecret('/home/u', { platform: 'linux', username: 'u' }).startsWith('zcode-credential-fallback:linux:/home/u:u')
+    || Boolean(process.env.ZCODE_CREDENTIAL_SECRET), true);
+});
+
+test('ZCode 规范化哈希：与键序无关，忽略设备相关键', () => {
+  const a = { b: '2', a: '1', 'web-remote-control:x': 'dev-1' };
+  const b = { a: '1', b: '2', 'web-remote-control:x': 'dev-2' };
+  assert.equal(zc.canonicalHash(a), zc.canonicalHash(b));
+  assert.notEqual(zc.canonicalHash(a), zc.canonicalHash({ a: '1', b: '3' }));
+});
+
+test('ZCode 冷切换：写回凭据 / 配置 / 每账号独立设备 ID', async () => {
+  const fake = await fs.mkdtemp(path.join(os.tmpdir(), 'zcode-home-'));
+  const saved = process.env.ZCODE_HOME;
+  process.env.ZCODE_HOME = fake;
+  try {
+    const zl = await import('../src/zcodeLocal.js');
+    const v2 = path.join(fake, '.zcode', 'v2');
+    await fs.mkdir(v2, { recursive: true });
+    await fs.writeFile(path.join(v2, 'credentials.json'), JSON.stringify({ zcodejwttoken: 'jwt-A-xxxxxxxxxxxxxxxxxxxxxxxx' }));
+    await fs.writeFile(path.join(v2, 'telemetry-state.json'), JSON.stringify({ deviceMid: 'mid-A', lastDailyActiveDate: '2026-09-24' }));
+    const live = zl.liveToAccount();
+    assert.equal(live.provider, 'zcode');
+    assert.equal(live.meta.deviceMid, 'mid-A', '导入时沿用本机当前设备 ID');
+
+    const target = store.normalizeAccountInput({
+      provider: 'zcode', token: 'zcode-creds:B', uid: 'B',
+      meta: { credentials: { zcodejwttoken: 'jwt-B-xxxxxxxxxxxxxxxxxxxxxxxx' }, config: { provider: {} } },
+    });
+    const r = zl.switchTo(target, { force: true });
+    assert.equal(r.switched, true);
+    const written = JSON.parse(await fs.readFile(path.join(v2, 'credentials.json'), 'utf8'));
+    assert.equal(written.zcodejwttoken, 'jwt-B-xxxxxxxxxxxxxxxxxxxxxxxx');
+    const tele = JSON.parse(await fs.readFile(path.join(v2, 'telemetry-state.json'), 'utf8'));
+    assert.equal(tele.deviceMid, target.meta.deviceMid, '写入目标账号的虚拟设备 ID');
+    assert.notEqual(tele.deviceMid, 'mid-A');
+    assert.equal(tele.lastDailyActiveDate, '2026-09-24', '保留 telemetry 其他字段');
+    assert.equal(zl.switchTo(target, { force: true }).alreadyActive, true);
+  } finally {
+    if (saved === undefined) delete process.env.ZCODE_HOME; else process.env.ZCODE_HOME = saved;
+  }
+});
+
+test('ZCode 额度解析：BigModel 窗口额度 / Z.ai 余额 / 无套餐', () => {
+  const q = zcodeClient.normalizeQuotaLimit({
+    code: 200, success: true,
+    data: { level: 'lite', limits: [
+      { type: 'TOKENS_LIMIT', usage: 120, currentValue: 20, remaining: 100, nextResetTime: 1790000000000 },
+      { type: 'TIME_LIMIT', usage: 300, currentValue: 60, remaining: 240 },
+    ] },
+  }, { code: 200, success: true, data: [{ status: 'VALID', productName: 'GLM Coding Lite' }] });
+  assert.deepEqual({ r: q.remaining, t: q.total, u: q.unit, plan: q.plan, n: q.parts.length }, { r: 240, t: 300, u: '分钟', plan: 'GLM Coding Lite', n: 2 });
+  assert.equal(q.parts[0].unit, '次');
+  const b = zcodeClient.normalizeBalance({ code: 0, data: { plans: [], balances: [] } });
+  assert.equal(b.empty, true);
+});
+
+test('过期时间：数字字符串（秒 / 毫秒）也能解析', () => {
+  assert.equal(store.normalizeExpiry('1790000000'), new Date(1790000000 * 1000).toISOString());
+  assert.equal(store.normalizeExpiry('1790000000000'), new Date(1790000000000).toISOString());
+  assert.equal(store.normalizeExpiry('garbage'), null);
+});
+
+test('导出范围：按 provider 或按产品整体筛选', () => {
+  const accs = [
+    { id: 'a', provider: 'qoder', token: 'dt-a' },
+    { id: 'b', provider: 'qoder-cn', token: 'dt-b' },
+    { id: 'c', provider: 'workbuddy', token: 'eyJc' },
+    { id: 'd', provider: 'workbuddy-intl', token: 'eyJd' },
+    { id: 'e', provider: 'zcode', token: 'z-e' },
+  ];
+  const ids = (o) => transfer.buildExportPayload(accs, o).accounts.map((x) => x.provider);
+  assert.deepEqual(ids({ product: 'workbuddy' }), ['workbuddy', 'workbuddy-intl']);
+  assert.deepEqual(ids({ product: 'qoder' }), ['qoder', 'qoder-cn']);
+  assert.deepEqual(ids({ provider: 'workbuddy-intl' }), ['workbuddy-intl']);
+  assert.equal(ids({}).length, 5);
+});
+
+// ── 浏览器登录（WorkBuddy / ZCode）：用假 fetch 走完整流程 ──
+function mockFetch(routes) {
+  const orig = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({ url: String(url), init });
+    for (const [re, fn] of routes) {
+      if (re.test(String(url))) {
+        const r = fn(String(url), init);
+        return new Response(JSON.stringify(r.body), { status: r.status || 200 });
+      }
+    }
+    return new Response('{}', { status: 404 });
+  };
+  return { calls, restore: () => { globalThis.fetch = orig; } };
+}
+
+test('ZCode enc:v1 加密与解密互逆', () => {
+  const v = zc.encryptWithSecret('你好 token', 'sec');
+  assert.ok(v.startsWith('enc:v1:'));
+  assert.equal(zc.decryptWithSecret(v, 'sec'), '你好 token');
+  assert.throws(() => zc.decryptWithSecret(v, 'other'));
+});
+
+test('ZCode 浏览器登录：init → pending → ready，凭据按客户端格式加密入账号', async () => {
+  const za = await import('../src/zcodeAuth.js');
+  let polls = 0;
+  const m = mockFetch([
+    [/oauth\/cli\/init$/, () => ({ body: { code: 0, data: { flow_id: 'f1', authorize_url: 'https://bigmodel.cn/login?appId=zcode&state=s', expires_at: Math.floor(Date.now() / 1000) + 600, poll_interval_sec: 2 } } })],
+    [/oauth\/cli\/poll\/f1$/, () => (++polls < 2
+      ? { body: { code: 0, data: { status: 'pending' } } }
+      : { body: { code: 0, data: { status: 'ready', token: 'zjwt', user: { user_id: 42, name: '小明', email: 'm@x.com' }, bigmodel: { access_token: 'bm-at', refresh_token: 'bm-rt' } } } })],
+  ]);
+  try {
+    const s = await za.startZcodeLogin('zcode-bigmodel');
+    assert.equal(s.data.provider, 'bigmodel');
+    assert.match(m.calls[0].init.headers.Authorization, /^Bearer [0-9a-f]{64}$/);
+    assert.equal((await za.pollZcodeLogin(s.data)).status, 'pending');
+    const r = await za.pollZcodeLogin(s.data);
+    assert.equal(r.status, 'ok');
+    assert.equal(m.calls[2].init.headers.Authorization, m.calls[0].init.headers.Authorization);   // 轮询用同一 poll token
+    const { input } = r;
+    assert.equal(input.provider, 'zcode');
+    assert.equal(input.uid, '42');
+    assert.equal(input.token, 'zcode-creds:42');
+    assert.equal(input.name, '小明');
+    assert.ok(!('deviceMid' in input.meta) && !('config' in input.meta));
+    const secret = zc.defaultSecret((await import('../src/zcodeLocal.js')).zcodePaths().home);
+    const c = input.meta.credentials;
+    assert.ok(zc.isLoggedIn(c));
+    assert.equal(zc.safeDecrypt(c['oauth:active_provider'], secret), 'bigmodel');
+    assert.equal(zc.safeDecrypt(c['oauth:bigmodel:access_token'], secret), 'bm-at');
+    assert.equal(zc.safeDecrypt(c['oauth:bigmodel:refresh_token'], secret), 'bm-rt');
+    assert.equal(zc.safeDecrypt(c.zcodejwttoken, secret), 'zjwt');
+    assert.equal(zc.identityWithSecret(c, secret).userId, '42');
+  } finally { m.restore(); }
+});
+
+test('ZCode 浏览器登录：Z.ai 换业务 token；授权失败终止', async () => {
+  const za = await import('../src/zcodeAuth.js');
+  const m = mockFetch([
+    [/poll\/ok$/, () => ({ body: { code: 0, data: { status: 'ready', token: 'j', user: { user_id: 'u1' }, zai: { access_token: 'oauth-at' } } } })],
+    [/poll\/bad$/, () => ({ body: { code: 0, data: { status: 'failed' } } })],
+    [/api\.z\.ai\/api\/auth\/z\/login$/, (_u, init) => ({ body: { code: 0, success: true, data: { access_token: 'biz-' + JSON.parse(init.body).token } } })],
+  ]);
+  try {
+    const secret = zc.defaultSecret((await import('../src/zcodeLocal.js')).zcodePaths().home);
+    const r = await za.pollZcodeLogin({ provider: 'zai', flowId: 'ok', pollToken: 't' });
+    assert.equal(zc.safeDecrypt(r.input.meta.credentials['oauth:zai:access_token'], secret), 'biz-oauth-at');
+    await assert.rejects(za.pollZcodeLogin({ provider: 'bigmodel', flowId: 'bad', pollToken: 't' }), /授权失败/);
+  } finally { m.restore(); }
+});
+
+test('WorkBuddy 浏览器登录：state → 等 token → 等账号 → 组装成可切换的客户端会话', async () => {
+  const wa = await import('../src/workbuddyAuth.js');
+  const token = fakeJwt({ iss: 'https://www.codebuddy.cn/auth/realms/copilot', sub: 'uid-1', exp: Math.floor(Date.now() / 1000) + 86400 });
+  let tokenPolls = 0, accountPolls = 0;
+  const m = mockFetch([
+    [/auth\/state\?platform=WorkBuddy$/, () => ({ body: { code: 0, data: { state: 'st', authUrl: 'https://www.codebuddy.cn/login?platform=WorkBuddy&state=st' } } })],
+    [/auth\/token\?state=st$/, () => (++tokenPolls < 2 ? { body: { code: 11217, msg: 'retry' } } : { body: { code: 0, data: { accessToken: token, refreshToken: 'rt', expiresIn: 3600, refreshExpiresIn: 7200, tokenType: 'Bearer' } } })],
+    [/login\/account\?state=st$/, () => (++accountPolls < 2 ? { body: { code: 12151 } } : { body: { code: 0, data: { uid: 'uid-1', nickname: '阿强', type: 'personal' } } })],
+    [/plugin\/accounts$/, () => ({ body: { code: 0, data: { accounts: [{ uid: 'uid-1', nickname: '阿强', pluginEnabled: true, phoneNumber: '13800000000' }, { uid: 'ent', pluginEnabled: false }] } } })],
+  ]);
+  try {
+    const s = await wa.startWorkbuddyLogin('workbuddy');
+    assert.equal(s.data.host, 'www.codebuddy.cn');
+    assert.equal((await wa.pollWorkbuddyLogin(s.data)).status, 'pending');   // token 未就绪
+    assert.equal((await wa.pollWorkbuddyLogin(s.data)).status, 'pending');   // token 就绪，账号未就绪
+    const r = await wa.pollWorkbuddyLogin(s.data);
+    assert.equal(r.status, 'ok');
+    const { input } = r;
+    assert.equal(input.provider, 'workbuddy');
+    assert.equal(input.token, token);
+    assert.equal(input.refreshToken, 'rt');
+    assert.equal(input.uid, 'uid-1');
+    assert.equal(input.name, '阿强');
+    assert.equal(input.source, 'browser');
+    assert.equal(input.meta.domain, 'www.codebuddy.cn');
+    assert.equal(input.meta.session.account.phoneNumber, '13800000000');   // 用账号列表补齐
+    assert.deepEqual(input.meta.session.accounts.map((a) => a.uid), ['uid-1']);
+    assert.equal(input.meta.session.allAccounts.length, 2);
+    assert.ok(!('accessToken' in input.meta.session.auth) && !('refreshToken' in input.meta.session.auth));
+  } finally { m.restore(); }
+});
+
+test('WorkBuddy 国际版浏览器登录走 www.workbuddy.ai（不是 CodeBuddy 国际站）', async () => {
+  const wa = await import('../src/workbuddyAuth.js');
+  const m = mockFetch([
+    [/auth\/state\?platform=WorkBuddy$/, () => ({ body: { code: 0, data: { state: 'st', authUrl: 'https://www.workbuddy.ai/login?platform=WorkBuddy&state=st' } } })],
+  ]);
+  try {
+    const s = await wa.startWorkbuddyLogin('workbuddy-intl');
+    assert.equal(s.data.host, 'www.workbuddy.ai');
+    assert.match(m.calls[0].url, /^https:\/\/www\.workbuddy\.ai\//);
+    assert.equal(m.calls[0].init.headers['X-Domain'], 'www.workbuddy.ai');
+  } finally { m.restore(); }
+});
+
+// ── Qoder 设备身份组件：从 qodercli 包里提取 UMID ──
+function fakeElf(machine, len = 64) {
+  const b = Buffer.alloc(len, 7);
+  Buffer.from([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1, 0]).copy(b, 0);
+  b.writeUInt16LE(machine, 18);
+  return b;
+}
+function tarOf(files) {
+  const blocks = [];
+  for (const [name, data] of files) {
+    const h = Buffer.alloc(512);
+    h.write(name, 0);
+    h.write(data.length.toString(8).padStart(11, '0') + '\0', 124);
+    h.write('0', 156);
+    blocks.push(h, data, Buffer.alloc((512 - (data.length % 512)) % 512));
+  }
+  blocks.push(Buffer.alloc(1024));
+  return Buffer.concat(blocks);
+}
+
+test('设备身份组件：tar 取文件 / 按架构挑 ELF / npm integrity 校验', async () => {
+  const um = await import('../src/qoderUmid.js');
+  const x64 = fakeElf(62), arm = fakeElf(183);
+  const js = `var a="z/rt/gwAAAA",b="${arm.toString('base64')}",c="${x64.toString('base64')}",d="TVqQAAMAAAAEAAAA";`;
+  assert.deepEqual(um.extractElf(js, 62), x64);
+  assert.deepEqual(um.extractElf(js, 183), arm);
+  assert.equal(um.extractElf(js, 40), null);
+
+  const tar = tarOf([['package/package.json', Buffer.from('{}')], ['package/bundle/qodercli.js', Buffer.from(js)]]);
+  assert.equal(um.tarEntry(tar, 'package/bundle/qodercli.js').toString(), js);
+  assert.equal(um.tarEntry(tar, 'package/nope.js'), null);
+
+  const integrity = 'sha512-' + nodeCrypto.createHash('sha512').update(tar).digest('base64');
+  assert.ok(um.checkIntegrity(tar, integrity));
+  assert.ok(!um.checkIntegrity(Buffer.concat([tar, Buffer.from('x')]), integrity));
+  assert.ok(!um.checkIntegrity(tar, 'sha1-abc'));
+
+  assert.ok(um.umidSupported('linux', 'x64') && um.umidSupported('linux', 'arm64'));
+  assert.ok(!um.umidSupported('win32', 'x64') && !um.umidSupported('linux', 'ia32'));
+});
+
+test('账号续期：换上新 token 时清掉旧 token 留下的失败结果与校验错误', async () => {
+  await store.withAccounts((list) => {
+    list.push({
+      id: 'renew-1', provider: 'workbuddy', name: '续期测试', token: 'old-token', uid: 'renew-uid', createdAt: new Date().toISOString(),
+      verified: false, verifyError: 'HTTP 401',
+      lastResult: { at: new Date().toISOString(), status: 'failed', message: '登录已失效，请在 WorkBuddy 客户端重新登录该账号后，到「添加账号 → 本机导入」同步' },
+    });
+    list.push({
+      id: 'renew-2', provider: 'workbuddy', name: '已签到', token: 'tok-2', uid: 'renew-uid-2', createdAt: new Date().toISOString(),
+      lastResult: { at: new Date().toISOString(), status: 'checked-in', amount: 5 },
+    });
+  });
+  const r = await importAccounts([
+    { provider: 'workbuddy', token: 'new-token', uid: 'renew-uid' },
+    { provider: 'workbuddy', token: 'tok-2b', uid: 'renew-uid-2' },
+  ]);
+  assert.equal(r.updated, 2);
+  const list = await store.loadAccounts();
+  const a = list.find((x) => x.id === 'renew-1');
+  assert.equal(a.token, 'new-token');
+  assert.equal(a.lastResult, null);
+  assert.equal(a.verifyError, undefined);
+  assert.equal(list.find((x) => x.id === 'renew-2').lastResult.status, 'checked-in');   // 成功结果保留
+});
+
+// WorkBuddy 国际版「活跃领取」线已整体删除（机制本体下线，workbuddy-intl 产品线保留只看额度），
+// 其行为测试随之移除；providers 对 workbuddy-intl 不再暴露 checkin（runTick 过滤天然跳过）。
+
+test('atomicWrite：rename 被瞬时占用时重试，仍失败则兜底直写且不留临时文件', async () => {
+  const dir = process.env.CREDITDADDY_HOME;
+  const f = path.join(dir, 'atomic-test.json');
+
+  // 前两次 EPERM，第三次成功 → 走 rename 路径（mock 成功时委托真实 rename）
+  let calls = 0;
+  store._setRenameForTests(async (a, b) => {
+    calls++;
+    if (calls < 3) { const e = new Error('operation not permitted'); e.code = 'EPERM'; throw e; }
+    return fs.rename(a, b);
+  });
+  await store.atomicWrite(f, '{"a":1}');
+  assert.equal(calls, 3);
+  assert.equal(JSON.parse(await fs.readFile(f, 'utf8')).a, 1);
+
+  // 一直 EBUSY → 兜底直写成功，临时文件清理干净
+  calls = 0;
+  store._setRenameForTests(async () => { calls++; const e = new Error('busy'); e.code = 'EBUSY'; throw e; });
+  await store.atomicWrite(f, '{"b":2}');
+  assert.ok(calls >= 2, '应发生重试');
+  assert.equal(JSON.parse(await fs.readFile(f, 'utf8')).b, 2);
+  const leftovers = (await fs.readdir(dir)).filter((x) => x.startsWith('.tmp-atomic-test'));
+  assert.deepEqual(leftovers, [], '不应留下临时文件残留');
+
+  store._setRenameForTests(null);
+  await fs.unlink(f).catch(() => {});
+});
+
+test('Trae 设备身份出站：deviceId 进 psd.creditDaddyTraeDevice（10R 签到防 9074），私钥不随载荷出本机', () => {
+  const a = store.normalizeAccountInput({ provider: 'trae', token: 'eyJhbGciOiJFUzI1NiJ9.tok.sig', uid: '7000000000000001' });
+  a.meta.traeDevice = {
+    deviceId: '9001000000000001',
+    machineId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+    publicKeyPem: '-----BEGIN PUBLIC KEY-----X',
+    privateKeyJwk: { kty: 'EC', crv: 'P-256', d: 'secret-d-value' },
+  };
+  const row = transfer.buildExportPayload([a]).accounts[0];
+  assert.equal(row.providerSpecificData.creditDaddyTraeDevice.deviceId, '9001000000000001', '10R 导入端持久化 psd 即零改动拿到设备号');
+  assert.equal(row.providerSpecificData.creditDaddyTraeDevice.machineId, 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
+  assert.equal(row.meta.traeDevice.deviceId, '9001000000000001', 'meta.traeDevice 保留（machineId/publicKeyPem 仍随行）');
+  assert.equal(row.meta.traeDevice.privateKeyJwk, undefined, '私钥只服务 CD 本机 DeviceProof 签名，不随载荷出本机');
+  // 非 trae 账号不挂这个字段
+  const q = transfer.buildExportPayload([store.normalizeAccountInput({ provider: 'qoder', token: 'jt-tok', uid: 'u-1' })]).accounts[0];
+  assert.equal(q.providerSpecificData.creditDaddyTraeDevice, undefined);
+});

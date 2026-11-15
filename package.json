@@ -1,0 +1,34 @@
+{
+  "name": "creditdaddy",
+  "version": "1.7.2",
+  "description": "CreditDaddy — Qoder / WorkBuddy / ZCode / mirasim / 妙手 / Trae / MiniMax / ModelScope / 豆包 Doubao / 讯飞 Loomy / WPS 灵犀 / Meoo 秒悟多账号本地管理与每日积分自动签到助手，及 10Router 供应商 Cookie 会话捕获与外部配额（Token Harbor / 小米 MiMo / River / ModelScope 魔搭 / LongCat）",
+  "homepage": "https://github.com/techysy/CreditDaddy",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/techysy/CreditDaddy.git"
+  },
+  "type": "module",
+  "bin": {
+    "creditdaddy": "bin/creditdaddy.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE",
+    "build.json"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node bin/creditdaddy.js daemon",
+    "test": "node --test",
+    "release-check": "bash scripts/release-check.sh",
+    "prepack": "node scripts/gen-build-info.js build.json"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "opencc-js": "1.4.2"
+  }
+}

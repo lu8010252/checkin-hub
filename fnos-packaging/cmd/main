@@ -1,0 +1,170 @@
+#!/bin/bash
+set -euo pipefail
+
+APP_NAME="${TRIM_APPNAME:-creditdaddy}"
+APP_DIR="${TRIM_APPDEST:-/var/apps/${APP_NAME}}"
+APP_VOL=""
+if [ -n "${TRIM_PKGVAR:-}" ]; then
+    DATA_DIR="${TRIM_PKGVAR}"
+else
+    if [ -L "${APP_DIR}/home" ]; then
+        APP_HOME="$(readlink -f "${APP_DIR}/home")"
+        APP_VOL="$(printf '%s' "${APP_HOME}" | awk -F/ 'NF>2 && $2 ~ /^vol/ {print "/"$2; exit}')"
+    fi
+    if [ -z "${APP_VOL}" ]; then
+        APP_VOL="$(printf '%s' "${APP_DIR}" | awk -F/ 'NF>2 && $2 ~ /^vol/ {print "/"$2; exit}')"
+    fi
+    if [ -n "${APP_VOL}" ]; then
+        DATA_DIR="${APP_VOL}/@appdata/${APP_NAME}"
+    else
+        DATA_DIR="${APP_DIR}/var"
+    fi
+fi
+
+# 服务目录（兼容两种部署布局）
+if [ -d "${APP_DIR}/server" ]; then
+    SRC_DIR="${APP_DIR}/server"
+elif [ -d "${APP_DIR}/target/server" ]; then
+    SRC_DIR="${APP_DIR}/target/server"
+else
+    echo "ERROR: server dir not found" >&2
+    exit 1
+fi
+
+# Node.js 运行时（manifest install_dep_apps=nodejs_v24 提供）
+APP_VOL="$(printf '%s' "${DATA_DIR}" | awk -F/ 'NF>2 && $2 ~ /^vol/ {print "/"$2; exit}')"
+NODE_BIN=""
+for cand in "/var/apps/nodejs_v24/target/bin/node" "${APP_VOL}/@appcenter/nodejs_v24/bin/node" "/vol4/@appcenter/nodejs_v24/bin/node"; do
+  [ -x "$cand" ] && NODE_BIN="$cand" && break
+done
+[ -n "$NODE_BIN" ] || NODE_BIN="$(command -v node || echo /usr/bin/node)"
+if [ ! -x "$NODE_BIN" ]; then
+  echo "ERROR: Node.js runtime not found. Please install nodejs_v24 from fnOS App Center." >&2
+  exit 1
+fi
+
+PORT="${TRIM_SERVICE_PORT:-47860}"
+HOSTNAME="0.0.0.0"
+LOG="${DATA_DIR}/creditdaddy.log"
+PID_FILE="${DATA_DIR}/creditdaddy.pid"
+KEY_FILE="${DATA_DIR}/panel_key"
+
+# fnOS 统一网关反代（issue #39）：公网 HTTPS 入口（反代 / Tunnel）按主机名拼出
+# http://域名:47860 不可达 → 桌面/APP 白屏。走统一网关（ui/config 的 gatewaySocket
+# 声明 app.sock，fnOS 把 /app/creditdaddy/* 转给 target/app.sock），窗口 443 直达。
+GW_SOCK="${TRIM_APPDEST_SOCK:-/var/apps/${APP_NAME}/target/app.sock}"
+GW_LOG="${DATA_DIR}/gateway-proxy.log"
+GW_PID="${DATA_DIR}/gateway-proxy.pid"
+
+migrate_legacy() {
+    # 项目曾名 QoderDaddy（appname=qoderdaddy）：首次启动时把旧应用的账号数据与面板密钥复制过来
+    [ -d "${DATA_DIR}/data" ] && return 0
+    LEGACY_DIR="$(dirname "${DATA_DIR}")/qoderdaddy"
+    [ "${LEGACY_DIR}" = "${DATA_DIR}" ] && return 0
+    if [ -d "${LEGACY_DIR}/data" ]; then
+        mkdir -p "${DATA_DIR}"
+        cp -a "${LEGACY_DIR}/data" "${DATA_DIR}/data" 2>/dev/null || true
+        [ -f "${LEGACY_DIR}/panel_key" ] && [ ! -f "${DATA_DIR}/panel_key" ] && cp -a "${LEGACY_DIR}/panel_key" "${DATA_DIR}/panel_key"
+        echo "migrated data from ${LEGACY_DIR}"
+    fi
+}
+
+# 统一网关反代：app.sock（fnOS 网关 → 本代理 → 127.0.0.1:$PORT）。
+# 无网关场景（ui/config 未声明 gatewaySocket 的旧包 / 直连 47860）不受影响——
+# 代理只是多一条访问路径，起不来不挡主服务。
+start_gateway_proxy() {
+    if [ -f "${GW_PID}" ] && kill -0 "$(cat "${GW_PID}")" 2>/dev/null; then
+        return 0
+    fi
+    mkdir -p "$(dirname "${GW_SOCK}")" 2>/dev/null || true
+    rm -f "${GW_SOCK}" 2>/dev/null || true
+    GW_SRC="$(dirname "$0")/../gateway-proxy.mjs"
+    [ -f "${GW_SRC}" ] || GW_SRC="$(dirname "$0")/gateway-proxy.mjs"
+    [ -f "${GW_SRC}" ] || GW_SRC="${SRC_DIR}/../gateway-proxy.mjs"
+    if [ ! -f "${GW_SRC}" ]; then
+        echo "gateway proxy script not found, skip (direct port access still works)"
+        return 0
+    fi
+    SOCK_PATH="${GW_SOCK}" CD_PORT="${PORT}" GATEWAY_PREFIX="/app/${APP_NAME}" \
+        nohup "${NODE_BIN}" "${GW_SRC}" >> "${GW_LOG}" 2>&1 &
+    echo $! > "${GW_PID}"
+    # 等 socket 文件出现（最多 5s），失败仅记日志不阻塞主服务
+    for i in $(seq 1 10); do
+        [ -S "${GW_SOCK}" ] && { echo "gateway proxy ready (${GW_SOCK})"; return 0; }
+        sleep 0.5 2>/dev/null || sleep 1
+    done
+    echo "gateway proxy socket timeout (check ${GW_LOG}); direct port access still works"
+    return 0
+}
+
+start() {
+    mkdir -p "${DATA_DIR}"
+    migrate_legacy
+    start_gateway_proxy
+    if [ -f "${PID_FILE}" ] && kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
+        echo "already running (pid $(cat "${PID_FILE}"))"
+        return 0
+    fi
+    # 面板访问密码：优先用安装向导设置的（install_callback 已写入 panel_key；这里兜底读环境变量），
+    # 都没有时（如命令行安装）才随机生成。密码只存 panel_key（0600），不打印、不写日志
+    if [ ! -f "${KEY_FILE}" ]; then
+        PW="${wizard_panel_password:-}"
+        if [ -z "${PW}" ]; then
+            PW="$("${NODE_BIN}" -e 'process.stdout.write(require("crypto").randomBytes(12).toString("base64url"))' 2>/dev/null || head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+            echo "未设置面板访问密码，已随机生成并存于 ${KEY_FILE}；可在 fnOS「应用设置」里改成自己的密码"
+        fi
+        ( umask 077; printf '%s' "${PW}" > "${KEY_FILE}" )
+        chmod 600 "${KEY_FILE}"
+        printf '%s panel_key initialized\n' "$(date '+%F %T')" >> "${LOG}"
+    fi
+    PW="$(cat "${KEY_FILE}")"
+    cd "${SRC_DIR}"
+    # CREDITDADDY_HOME=数据目录；HOST/PORT/密钥 经环境变量注入 daemon
+    DATA_DIR="${DATA_DIR}" CREDITDADDY_HOME="${DATA_DIR}/data" PORT="${PORT}" HOST="${HOSTNAME}" \
+        CREDITDADDY_PASSWORD="${PW}" INSTALL_CHANNEL="fpk" \
+        nohup "${NODE_BIN}" bin/creditdaddy.js daemon >> "${LOG}" 2>&1 &
+    echo $! > "${PID_FILE}"
+    for i in $(seq 1 30); do
+        if curl -sf -H "x-qd-key: ${PW}" "http://127.0.0.1:${PORT}/api/status" >/dev/null 2>&1; then
+            echo "started (pid $(cat "${PID_FILE}"))"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "started, but health check timed out (check ${LOG})"
+    return 0
+}
+
+stop() {
+    if [ -f "${PID_FILE}" ]; then
+        kill "$(cat "${PID_FILE}")" 2>/dev/null || true
+        rm -f "${PID_FILE}"
+    fi
+    pkill -f "${SRC_DIR}/bin/creditdaddy.js" 2>/dev/null || true
+    # 网关反代一并停（socket 文件由代理自身 SIGTERM 清理，残留时这里兜底）
+    if [ -f "${GW_PID}" ]; then
+        kill "$(cat "${GW_PID}")" 2>/dev/null || true
+        rm -f "${GW_PID}"
+    fi
+    # pid 文件丢失（异常退出/手动清数据目录）时进程会残留并占着 app.sock，按脚本名兜底清
+    pkill -f "gateway-proxy.mjs" 2>/dev/null || true
+    [ -n "${GW_SOCK}" ] && rm -f "${GW_SOCK}" 2>/dev/null || true
+    echo "stopped"
+}
+
+status() {
+    if [ -f "${PID_FILE}" ] && kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
+        echo "running"
+        return 0
+    fi
+    echo "stopped"
+    return 1
+}
+
+case "${1:-start}" in
+    start) start ;;
+    stop) stop ;;
+    status) status ;;
+    restart) stop; sleep 1; start ;;
+    *) echo "Usage: $0 {start|stop|status|restart}"; exit 1 ;;
+esac

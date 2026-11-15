@@ -1,0 +1,1 @@
+{".url": {"creditdaddy.Application": {"title": "CreditDaddy", "icon": "images/icon_{0}.png", "type": "iframe", "microApp": true, "port": "", "protocol": "http", "gatewaySocket": "app.sock", "gatewayPrefix": "/app/creditdaddy", "url": "/app/creditdaddy/", "allUsers": true}}}
